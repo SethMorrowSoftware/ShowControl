@@ -53,21 +53,32 @@ private foreign handler _dlerror() returns optional ZStringNative binds to "c:>d
 variable sDrain as Data
 variable sDrainReady as Boolean
 
-private constant kDrainCap is 16384
+-- Must be >= the C shim's largest single drain record: a 2-byte length prefix, a
+-- 65535-byte maximum SysEx payload, and a 4-byte delta = 65541 bytes. A smaller
+-- cap lets an inbound message bigger than the buffer get stashed but never
+-- re-emitted, permanently wedging the input port. (Allocated just once.)
+private constant kDrainCap is 65541
 
 private handler ensureDrainBuf()
    if sDrainReady is true then
       return
    end if
+   -- One-time setup (guarded by sDrainReady; never runs in the poll hot path).
+   -- Build a 256-byte zero chunk, then append whole chunks to cover kDrainCap, so
+   -- this costs a few hundred appends rather than one per byte -- cheap no matter
+   -- how Data growth is implemented underneath.
+   variable tChunk as Data
+   put the empty data into tChunk
+   variable i as Integer
+   repeat with i from 1 up to 256
+      put numToByte(0) after tChunk
+   end repeat
    variable tBuf as Data
    put the empty data into tBuf
-   variable tZero as Data
-   put numToByte(0) into tZero
-   variable i as Integer
-   repeat with i from 1 up to kDrainCap
-      put tZero after tBuf
+   repeat with i from 1 up to ((kDrainCap div 256) + 1)
+      put tChunk after tBuf
    end repeat
-   put tBuf into sDrain
+   put byte 1 to kDrainCap of tBuf into sDrain
    put true into sDrainReady
 end handler
 
@@ -195,6 +206,27 @@ private handler bi(in pB as Boolean) returns Integer
    return 0
 end handler
 
+-- Clamp a value into a single MIDI data byte (0..127). Installations feed junk
+-- from sliders / fields / incoming data; a data byte with the high bit set is
+-- illegal MIDI and desyncs any receiver, and numToByte of an out-of-range value
+-- has engine-dependent behaviour. Clamp so the convenience API is junk-proof.
+private handler clamp7(in pV as Integer) returns Integer
+   if pV < 0 then
+      return 0
+   end if
+   if pV > 127 then
+      return 127
+   end if
+   return pV
+end handler
+
+-- Map a 1..16 channel to its 0..15 status-byte nibble, normalizing out-of-range.
+-- LCB mod follows the dividend's sign, so a bare (pChannel - 1) mod 16 goes
+-- negative for pChannel <= 0 and would corrupt the status byte.
+private handler chanNib(in pChannel as Integer) returns Integer
+   return (((pChannel - 1) mod 16) + 16) mod 16
+end handler
+
 -- =====================================================================
 -- Sending: raw + convenience
 -- =====================================================================
@@ -209,41 +241,51 @@ private handler send3(in pHandle as Integer, in pStatus as Integer, in pD1 as In
    variable tMsg as Data
    put numToByte(pStatus) into tMsg
    if pLen >= 2 then
-      put numToByte(pD1) after tMsg
+      put numToByte(clamp7(pD1)) after tMsg
    end if
    if pLen >= 3 then
-      put numToByte(pD2) after tMsg
+      put numToByte(clamp7(pD2)) after tMsg
    end if
    midiSend(pHandle, tMsg)
 end handler
 
 public handler midiNoteOn(in pHandle as Integer, in pChannel as Integer, in pNote as Integer, in pVelocity as Integer)
-   send3(pHandle, 144 + ((pChannel - 1) mod 16), pNote, pVelocity, 3)
+   send3(pHandle, 144 + chanNib(pChannel), pNote, pVelocity, 3)
 end handler
 
 public handler midiNoteOff(in pHandle as Integer, in pChannel as Integer, in pNote as Integer, in pVelocity as Integer)
-   send3(pHandle, 128 + ((pChannel - 1) mod 16), pNote, pVelocity, 3)
+   send3(pHandle, 128 + chanNib(pChannel), pNote, pVelocity, 3)
 end handler
 
 public handler midiControlChange(in pHandle as Integer, in pChannel as Integer, in pController as Integer, in pValue as Integer)
-   send3(pHandle, 176 + ((pChannel - 1) mod 16), pController, pValue, 3)
+   send3(pHandle, 176 + chanNib(pChannel), pController, pValue, 3)
 end handler
 
 public handler midiProgramChange(in pHandle as Integer, in pChannel as Integer, in pProgram as Integer)
-   send3(pHandle, 192 + ((pChannel - 1) mod 16), pProgram, 0, 2)
+   send3(pHandle, 192 + chanNib(pChannel), pProgram, 0, 2)
 end handler
 
 public handler midiChannelPressure(in pHandle as Integer, in pChannel as Integer, in pValue as Integer)
-   send3(pHandle, 208 + ((pChannel - 1) mod 16), pValue, 0, 2)
+   send3(pHandle, 208 + chanNib(pChannel), pValue, 0, 2)
 end handler
 
 -- 14-bit pitch bend, 0..16383 (8192 = centre).
 public handler midiPitchBend(in pHandle as Integer, in pChannel as Integer, in pValue14bit as Integer)
+   -- Clamp to the 14-bit range first; otherwise a negative or >16383 value makes
+   -- the mod/div below produce out-of-range (or negative) data bytes.
+   variable tVal as Integer
+   put pValue14bit into tVal
+   if tVal < 0 then
+      put 0 into tVal
+   end if
+   if tVal > 16383 then
+      put 16383 into tVal
+   end if
    variable tLsb as Integer
    variable tMsb as Integer
-   put pValue14bit mod 128 into tLsb
-   put (pValue14bit div 128) mod 128 into tMsb
-   send3(pHandle, 224 + ((pChannel - 1) mod 16), tLsb, tMsb, 3)
+   put tVal mod 128 into tLsb
+   put (tVal div 128) mod 128 into tMsb
+   send3(pHandle, 224 + chanNib(pChannel), tLsb, tMsb, 3)
 end handler
 
 -- =====================================================================

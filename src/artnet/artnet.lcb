@@ -109,6 +109,15 @@ end handler
 --   even and into 2..512, padding with zeros as needed).
 public handler artnetBuildDmx(in pUniverse as Integer, in pChannels as Data) returns Data
    put the empty string into sLastError
+   -- Reject an out-of-range port-address BEFORE packing. LCB's mod follows the
+   -- sign of the dividend, so a negative universe makes numToByte(pUniverse mod
+   -- 256) throw (out of the 0..255 byte domain), and a universe > 32767 would be
+   -- silently masked into a different (wrong) universe -- driving the wrong rig.
+   -- The API contract is "failure is quiet, never thrown": set last-error, return empty.
+   if pUniverse < 0 or pUniverse > 32767 then
+      put "artnetBuildDmx: universe out of range 0..32767" into sLastError
+      return the empty data
+   end if
    variable tLen as Integer
    put the number of bytes in pChannels into tLen
    if tLen > 512 then
@@ -180,6 +189,9 @@ public handler artnetParseDmx(in pData as Data) returns Array
    -- Length is big-endian
    variable tLen as Integer
    put byteToNum(byte 17 of pData) * 256 + byteToNum(byte 18 of pData) into tLen
+   if tLen > 512 then
+      put 512 into tLen           -- Art-Net DMX is 512 channels max; clamp a bad field
+   end if
    variable tAvail as Integer
    put the number of bytes in pData - 18 into tAvail
    if tLen > tAvail then

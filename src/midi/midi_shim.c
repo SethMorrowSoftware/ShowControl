@@ -146,7 +146,12 @@ static int32_t port_name(RtMidiPtr d, int32_t index, char *out, int32_t cap) {
     /* Guard !d->ok: when a backend fails to init, RtMidi returns a wrapper whose
        internal object is NULL -- calling rtmidi_get_port_name would deref it. */
     if (!d || !d->ok || index < 0) { if (out && cap > 0) out[0] = '\0'; return 0; }
-    /* rtmidi writes up to *bufLen bytes and sets *bufLen to the full length. */
+    /* RtMidi 6.0.0's rtmidi_get_port_name(bufOut != NULL) returns snprintf()'s
+       count -- the full name length, excluding the NUL -- and does NOT modify
+       *bufLen. (Only the bufOut == NULL query path writes *bufLen, and we always
+       pass a buffer.) So we trust the RETURN value, never the in/out length: the
+       old code inspected *bufLen, which stays == cap, making "too small" always
+       fire and a successful call return a bogus negative length. */
     int blen = cap;
     char tmp[256];
     char *dst = (cap > 0 && out) ? out : tmp;
@@ -154,10 +159,10 @@ static int32_t port_name(RtMidiPtr d, int32_t index, char *out, int32_t cap) {
     int rc = rtmidi_get_port_name(d, (unsigned)index, dst, &blen);
     if (rc < 0) { if (out && cap > 0) out[0] = '\0'; return 0; }
     if (dst == out) {
-        /* ensure NUL-termination within cap */
-        if (blen >= cap) { out[cap-1] = '\0'; return -(blen + 1); }
-        out[blen] = '\0';
-        return blen;
+        /* snprintf wrote min(rc, cap-1) chars + a NUL; rc is the full length. */
+        if (rc >= cap) { out[cap-1] = '\0'; return -(rc + 1); }  /* truncated: need rc+1 */
+        out[rc] = '\0';   /* snprintf already terminated here; keep it explicit */
+        return rc;
     }
     return copy_str(tmp, out, cap);
 }
@@ -255,12 +260,20 @@ MIDI_API int32_t midi_in_drain(int32_t handle, uint8_t *out, int32_t out_cap, in
     int32_t pos = 0, count = 0;
     static unsigned char tmp[65536];   /* single-threaded LCB caller -> static ok */
 
-    /* 1. flush a stashed message from a previous (buffer-full) drain first */
+    /* 1. flush a stashed message from a previous (buffer-full) drain first.
+     * pos is 0 here, so a failure means the record is structurally larger than
+     * out_cap and can NEVER fit -- drop it (with a diagnostic) rather than
+     * returning 0 forever and wedging the port until midiClose. With the LCB
+     * binding's kDrainCap >= the max record size (2 + 65535 + 4) this drop path
+     * is unreachable; it is defense-in-depth for any smaller caller buffer. */
     if (mp->has_stash) {
-        if (!emit_record(out, out_cap, &pos, mp->stash, mp->stash_len, mp->stash_delta_us))
-            return 0;                  /* caller buffer can't hold even one record */
+        int wrote = emit_record(out, out_cap, &pos, mp->stash, mp->stash_len, mp->stash_delta_us);
         free(mp->stash); mp->stash = NULL; mp->has_stash = 0;
-        count++;
+        if (wrote) {
+            count++;
+        } else {
+            err_set("midi: dropped an inbound message larger than the drain buffer");
+        }
     }
 
     /* 2. drain RtMidi's FIFO */

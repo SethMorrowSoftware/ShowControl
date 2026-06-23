@@ -12,6 +12,7 @@
 #include "osc_shim.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -151,6 +152,50 @@ int main(void) {
       check("over-long blob rejected",     osc_parse(bad, 12) == 0); }
     { uint8_t bad[4] = {'/','x','y','z'};            /* address never terminated */
       check("unterminated address rejected", osc_parse(bad, 4) == 0); }
+
+    /* ---- security regressions: hostile datagrams must be rejected, not crash ----
+       These reproduce defects found in pre-release review; run under ASan/UBSan. */
+    { /* bundle element size overflows int32 (old `p + elen > len` wrapped) */
+      uint8_t bad[20] = {'#','b','u','n','d','l','e',0, 0,0,0,0,0,0,0,0,
+                         0x7F,0xFF,0xFF,0xFC};
+      check("huge bundle element size rejected", osc_parse(bad, 20) == 0); }
+    { /* deeply nested bundles must hit the depth cap, not overflow the stack */
+      int32_t blen = 16;
+      uint8_t *nest = (uint8_t*) malloc(16);
+      memset(nest, 0, 16); memcpy(nest, "#bundle", 7);
+      for (int lvl = 0; lvl < 100; lvl++) {
+          int32_t nlen = 16 + 4 + blen;
+          uint8_t *nb = (uint8_t*) malloc((size_t) nlen);
+          memset(nb, 0, (size_t) nlen); memcpy(nb, "#bundle", 7);
+          nb[16]=(uint8_t)(blen>>24); nb[17]=(uint8_t)(blen>>16);
+          nb[18]=(uint8_t)(blen>>8);  nb[19]=(uint8_t)blen;
+          memcpy(nb + 20, nest, (size_t) blen);
+          free(nest); nest = nb; blen = nlen;
+      }
+      check("deeply nested bundle rejected (no stack overflow)", osc_parse(nest, blen) == 0);
+      free(nest); }
+    { /* positive INT32_MAX blob length (old `p + 4 + bl > len` wrapped -> 32-bit OOB) */
+      uint8_t bad[12] = {'/','x',0,0, ',','b',0,0, 0x7F,0xFF,0xFF,0xFF};
+      check("INT32_MAX blob length rejected", osc_parse(bad, 12) == 0); }
+    { /* a timetag ('t') is UNSIGNED -- a high-bit value must not read back negative */
+      uint8_t tt[16] = {'/','t',0,0, ',','t',0,0, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      int32_t th = osc_parse(tt, 16);
+      osc_arg_int64_str(th, 0, sbuf, sizeof sbuf);
+      check("UINT64_MAX timetag reads unsigned", strcmp(sbuf, "18446744073709551615") == 0);
+      osc_parse_free(th); }
+    { /* control: an int64 ('h') stays signed */
+      uint8_t hh[16] = {'/','h',0,0, ',','h',0,0, 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+      int32_t hhh = osc_parse(hh, 16);
+      osc_arg_int64_str(hhh, 0, sbuf, sizeof sbuf);
+      check("int64 'h' stays signed (-1)", strcmp(sbuf, "-1") == 0);
+      osc_parse_free(hhh); }
+    { /* a pathological '*'-heavy pattern must return promptly, not hang (ReDoS) */
+      char pat[128] = "/"; char str[128] = "/";
+      for (int i = 0; i < 20; i++) strcat(pat, "*a");
+      strcat(pat, "*b");
+      for (int i = 0; i < 40; i++) strcat(str, "a");
+      int r = osc_match(pat, str);
+      check("pathological match pattern returns (no ReDoS hang)", r == 0 || r == 1); }
 
     /* stale-handle no-ops */
     osc_address(999999, sbuf, sizeof sbuf);

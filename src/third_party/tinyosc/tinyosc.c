@@ -97,16 +97,20 @@ uint32_t tosc_getLength(tosc_message *o) {
 }
 
 int32_t tosc_getNextInt32(tosc_message *o) {
-  // convert from big-endian (network btye order)
-  const int32_t i = (int32_t) ntohl(*((uint32_t *) o->marker));
+  // convert from big-endian (network byte order).
+  // ShowControl local modification: o->marker is byte-advanced and generally NOT
+  // 4/8-aligned, so *((uint32_t*)marker) is a misaligned load -- UBSan flags it and
+  // it can SIGBUS or be miscompiled on arm64 (the universal-mac target). Read via
+  // memcpy instead; it compiles to the same instruction on x86 and is alignment-safe.
+  uint32_t u; memcpy(&u, o->marker, 4);
   o->marker += 4;
-  return i;
+  return (int32_t) ntohl(u);
 }
 
 int64_t tosc_getNextInt64(tosc_message *o) {
-  const int64_t i = (int64_t) ntohll(*((uint64_t *) o->marker));
+  uint64_t u; memcpy(&u, o->marker, 8);   // ShowControl: alignment-safe, see getNextInt32
   o->marker += 8;
-  return i;
+  return (int64_t) ntohll(u);
 }
 
 uint64_t tosc_getNextTimetag(tosc_message *o) {
@@ -114,16 +118,20 @@ uint64_t tosc_getNextTimetag(tosc_message *o) {
 }
 
 float tosc_getNextFloat(tosc_message *o) {
-  // convert from big-endian (network btye order)
-  const uint32_t i = ntohl(*((uint32_t *) o->marker));
+  // convert from big-endian (network byte order)
+  uint32_t i; memcpy(&i, o->marker, 4);   // ShowControl: alignment-safe, see getNextInt32
+  i = ntohl(i);
   o->marker += 4;
-  return *((float *) (&i));
+  float f; memcpy(&f, &i, sizeof f);       // memcpy pun avoids strict-aliasing UB too
+  return f;
 }
 
 double tosc_getNextDouble(tosc_message *o) {
-  const uint64_t i = ntohll(*((uint64_t *) o->marker));
+  uint64_t i; memcpy(&i, o->marker, 8);   // ShowControl: alignment-safe, see getNextInt32
+  i = ntohll(i);
   o->marker += 8;
-  return *((double *) (&i));
+  double d; memcpy(&d, &i, sizeof d);
+  return d;
 }
 
 const char *tosc_getNextString(tosc_message *o) {
