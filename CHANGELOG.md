@@ -41,8 +41,9 @@ bindings, the build/test/CI machinery, and the documentation set.
 ### Build, test & tooling
 - `CMakeLists.txt`: builds both shims (osc.{so,dll,dylib}, midi.{so,dll,dylib})
   under their bare token names; vendors tinyosc, fetches RtMidi; optional C tests.
-- `.github/workflows/build.yml`: static + golden + ASan gate, then portable
-  manylinux / macOS-universal / Windows builds, attaching binaries to releases.
+- `.github/workflows/build.yml`: static + golden + ASan gate, then
+  Linux-x86_64 / macOS-universal / Windows (x64 + x86) builds, attaching
+  binaries to releases.
 - `tools/check-livecodescript.py` (dual `.lcb` + `.livecodescript` linter),
   `tools/package-extension.py` (refresh the committed per-platform trees).
 - `docs/`: architecture, building, getting-started, api-reference, and the
@@ -53,3 +54,6 @@ bindings, the build/test/CI machinery, and the documentation set.
   (`docs/phase0-ffi-spike.md`); the C ABI is stable regardless of outcome.
 - Showcase demos and the example/helper script layer (README section 11).
 - Per-universe Art-Net sequence numbering and refresh-rate throttle.
+- Maximally-portable Linux binaries (glibc-2.17 floor via a manylinux container
+  with a modern toolchain) and 32-bit Linux builds; the current CI builds Linux
+  x86_64 on a standard runner.

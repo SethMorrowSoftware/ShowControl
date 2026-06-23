@@ -55,48 +55,31 @@ jobs:
           cmake --build build-asan -j
           ctest --test-dir build-asan --output-on-failure
 
-  # Portable Linux binaries in a manylinux2014 container (CentOS 7, glibc 2.17).
+  # Linux x86_64 on a modern toolchain. (Maximally-portable glibc-2.17 binaries
+  # via a manylinux container, and 32-bit Linux, are follow-ups -- RtMidi's C++
+  # needs a newer compiler than the manylinux2014 default; tracked in CHANGELOG.)
   build-linux:
-    name: build & test (${{ matrix.name }})
+    name: build & test (linux-x86_64)
     needs: static
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            image: quay.io/pypa/manylinux2014_x86_64
-            cmake_args: ""
-            both: "yes"          # build osc AND midi
-          - name: linux-i686
-            image: quay.io/pypa/manylinux2014_i686
-            cmake_args: "-DSHOWCONTROL_BUILD_MIDI=OFF"
-            both: "no"           # OSC only: 32-bit ALSA in the container is out of scope for now
     steps:
       - uses: actions/checkout@v4
-      - name: Build & smoke-test in ${{ matrix.image }}
+      - name: ALSA headers (for the MIDI shim)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Configure / build / test
         run: |
-          docker run --rm -v "$PWD":/io -w /io "${{ matrix.image }}" \
-            bash -euxo pipefail -c '
-              if [ "${{ matrix.both }}" = "yes" ]; then yum install -y alsa-lib-devel; fi
-              if ! command -v cmake >/dev/null 2>&1; then
-                PYBIN="$(ls -d /opt/python/cp31*-cp31*/bin 2>/dev/null | tail -1)"
-                "$PYBIN/pip" install --quiet cmake ninja
-                export PATH="$PYBIN:$PATH"
-              fi
-              cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON ${{ matrix.cmake_args }}
-              cmake --build build --config Release
-              ctest --test-dir build --output-on-failure
-              mkdir -p dist
-              cp "$(find build -maxdepth 2 -name osc.so | head -n1)" "dist/osc-${{ matrix.name }}.so"
-              if [ "${{ matrix.both }}" = "yes" ]; then
-                cp "$(find build -maxdepth 2 -name midi.so | head -n1)" "dist/midi-${{ matrix.name }}.so"
-              fi
-            '
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON
+          cmake --build build --config Release
+          ctest --test-dir build --output-on-failure
+      - name: Stage libraries
+        run: |
+          mkdir -p dist
+          cp "$(find build -maxdepth 2 -name osc.so  | head -n1)" dist/osc-linux-x86_64.so
+          cp "$(find build -maxdepth 2 -name midi.so | head -n1)" dist/midi-linux-x86_64.so
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
+          name: linux-x86_64
           path: dist/*
           if-no-files-found: error
 
