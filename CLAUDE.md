@@ -136,7 +136,11 @@ deliberate future item, behind the same script API.
    backend fails to initialize.** Calling any `rtmidi_*` function that dereferences the wrapped
    object then segfaults. **Guard every call on `wrapper->ok`** (ASan caught this as a real
    null-deref in `port_name` on a headless box with no `/dev/snd`). The shim now checks `->ok`
-   before touching the object everywhere.
+   before touching the object everywhere. **And never read `wrapper->msg`:** RtMidi's C wrapper
+   sets it to `err.what()`, a pointer into the thrown `RtMidiError`'s `std::string`, which is
+   freed the instant the `catch` block exits - reading it is a **use-after-free** (ASan caught
+   this in CI but not locally, because the locally-built RtMidi version differed from the pinned
+   `6.0.0`; this is why the ASan gate runs in CI). Use fixed error strings instead of `->msg`.
 6. **The MIDI drain must never drop a popped message.** `rtmidi_in_get_message` is destructive
    (it pops). If the caller buffer is full, the shim **stashes** the popped message per-port and
    emits it on the next drain - it does not re-pop and lose it. Honor "we never drop messages."

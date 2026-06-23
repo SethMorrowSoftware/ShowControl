@@ -174,7 +174,11 @@ static int32_t open_port(int is_input, int32_t portIndex, const char *vname) {
                            : (RtMidiPtr) rtmidi_out_create_default();
     if (!d) { err_set("midi: could not create RtMidi instance"); return 0; }
     if (!d->ok) {
-        err_set(d->msg ? d->msg : "midi: backend init failed");
+        /* Do NOT read d->msg: RtMidi's C wrapper sets it to err.what(), a pointer
+           into the thrown RtMidiError's std::string, which is freed the moment the
+           catch block exits -- reading it is a use-after-free (ASan-confirmed in
+           CI). Use a fixed message instead. */
+        err_set("midi: backend init failed (no MIDI service available?)");
         if (is_input) rtmidi_in_free(d); else rtmidi_out_free(d);
         return 0;
     }
@@ -190,7 +194,7 @@ static int32_t open_port(int is_input, int32_t portIndex, const char *vname) {
         rtmidi_open_port(d, (unsigned)portIndex, is_input ? "ShowControl In" : "ShowControl Out");
     }
     if (!d->ok) {
-        err_set(d->msg ? d->msg : "midi: open port failed");
+        err_set("midi: open port failed");   /* d->msg is unsafe to read (see above) */
         if (is_input) rtmidi_in_free(d); else rtmidi_out_free(d);
         return 0;
     }
@@ -290,7 +294,7 @@ MIDI_API int32_t midi_out_send(int32_t handle, const uint8_t *data, int32_t len)
     if (!mp || mp->is_input || !mp->ptr || !data || len <= 0) return 0;
     int rc = rtmidi_out_send_message(mp->ptr, data, len);
     if (rc < 0 || !mp->ptr->ok) {
-        err_set(mp->ptr->msg ? mp->ptr->msg : "midi: send failed");
+        err_set("midi: send failed");        /* d->msg is unsafe to read (see open_port) */
         return 0;
     }
     return 1;
