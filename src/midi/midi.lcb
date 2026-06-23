@@ -1,0 +1,388 @@
+/*
+midi.lcb - xTalk Builder (LCB) binding library for realtime MIDI I/O, via the
+           midi_shim C layer over RtMidi. Part of ShowControl for OpenXTalk (OXT).
+
+Output is request/response. Input uses RtMidi's internal FIFO plus POLLING: the
+script (or the shipped dispatcher) calls midiPoll on a timer and drains the
+queue. Nothing here calls back into script from a foreign thread (README 4.2/6).
+Because RtMidi buffers and delta-time-stamps every message, message integrity and
+timing survive jittery poll cadence; only added latency scales with the interval.
+
+Conventions:
+  * Handles are integers (0 = invalid); a stale handle is a harmless no-op.
+  * Channels in the public API are 1-based (1..16). Raw MIDI bytes are 0-based
+    on the wire; the convenience senders convert.
+  * MIDI byte buffers are LiveCode `Data`.
+
+The foreign handlers bind to the shared library "midi" (built by CMakeLists.txt,
+bundled inside the extension under code/<arch>-<platform>/midi.{so,dll,dylib}).
+*/
+
+library org.openxtalk.library.midi
+
+use com.livecode.foreign
+
+metadata title is "MIDI for OpenXTalk"
+metadata author is "ShowControl contributors"
+metadata version is "0.1.0"
+
+-- =====================================================================
+-- Foreign bindings to the shim (private)
+-- =====================================================================
+private foreign handler _abi_version() returns CInt binds to "c:midi>midi_abi_version!cdecl"
+private foreign handler _in_count() returns CInt binds to "c:midi>midi_in_count!cdecl"
+private foreign handler _out_count() returns CInt binds to "c:midi>midi_out_count!cdecl"
+private foreign handler _in_name_z(in pIndex as CInt) returns ZStringUTF8 binds to "c:midi>midi_in_name_str!cdecl"
+private foreign handler _out_name_z(in pIndex as CInt) returns ZStringUTF8 binds to "c:midi>midi_out_name_str!cdecl"
+private foreign handler _in_open(in pIndex as CInt) returns CInt binds to "c:midi>midi_in_open!cdecl"
+private foreign handler _out_open(in pIndex as CInt) returns CInt binds to "c:midi>midi_out_open!cdecl"
+private foreign handler _in_open_virtual(in pName as ZStringUTF8) returns CInt binds to "c:midi>midi_in_open_virtual!cdecl"
+private foreign handler _out_open_virtual(in pName as ZStringUTF8) returns CInt binds to "c:midi>midi_out_open_virtual!cdecl"
+private foreign handler _close(in pH as CInt) returns nothing binds to "c:midi>midi_close!cdecl"
+private foreign handler _in_ignore(in pH as CInt, in pSysex as CInt, in pTime as CInt, in pSense as CInt) returns nothing binds to "c:midi>midi_in_ignore!cdecl"
+private foreign handler _in_drain(in pH as CInt, in pOut as Pointer, in pCap as CInt, in pMax as CInt) returns CInt binds to "c:midi>midi_in_drain!cdecl"
+private foreign handler _out_send(in pH as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:midi>midi_out_send!cdecl"
+private foreign handler _error_z() returns ZStringUTF8 binds to "c:midi>midi_error_str!cdecl"
+
+private foreign handler _dlopen(in pPath as ZStringNative, in pFlags as CInt) returns optional Pointer binds to "c:>dlopen!cdecl"
+private foreign handler _dlerror() returns optional ZStringNative binds to "c:>dlerror!cdecl"
+
+-- =====================================================================
+-- Persistent drain buffer (reused every poll -- never rebuilt in the hot path).
+-- =====================================================================
+variable sDrain as Data
+variable sDrainReady as Boolean
+
+private constant kDrainCap is 16384
+
+private handler ensureDrainBuf()
+   if sDrainReady is true then
+      return
+   end if
+   variable tBuf as Data
+   put the empty data into tBuf
+   variable tZero as Data
+   put numToByte(0) into tZero
+   variable i as Integer
+   repeat with i from 1 up to kDrainCap
+      put tZero after tBuf
+   end repeat
+   put tBuf into sDrain
+   put true into sDrainReady
+end handler
+
+-- =====================================================================
+-- ABI guard
+-- =====================================================================
+public handler midiVersion() returns Integer
+   variable tR as Integer
+   unsafe
+      put _abi_version() into tR
+   end unsafe
+   return tR
+end handler
+
+private handler checkABI()
+   variable tV as Integer
+   unsafe
+      put _abi_version() into tV
+   end unsafe
+   if tV is not 1 then
+      throw "midi: incompatible native library (binding needs ABI 1) - update the midi shim"
+   end if
+end handler
+
+-- =====================================================================
+-- Enumeration
+-- =====================================================================
+public handler midiInputPorts() returns List
+   checkABI()
+   variable tCount as Integer
+   unsafe
+      put _in_count() into tCount
+   end unsafe
+   variable tList as List
+   put [] into tList
+   variable i as Integer
+   variable tName as String
+   if tCount > 0 then
+      repeat with i from 0 up to tCount - 1
+         unsafe
+            put _in_name_z(i) into tName
+         end unsafe
+         push tName onto tList
+      end repeat
+   end if
+   return tList
+end handler
+
+public handler midiOutputPorts() returns List
+   checkABI()
+   variable tCount as Integer
+   unsafe
+      put _out_count() into tCount
+   end unsafe
+   variable tList as List
+   put [] into tList
+   variable i as Integer
+   variable tName as String
+   if tCount > 0 then
+      repeat with i from 0 up to tCount - 1
+         unsafe
+            put _out_name_z(i) into tName
+         end unsafe
+         push tName onto tList
+      end repeat
+   end if
+   return tList
+end handler
+
+-- =====================================================================
+-- Open / close
+-- =====================================================================
+public handler midiOpenInput(in pIndex as Integer) returns Integer
+   checkABI()
+   variable tH as Integer
+   unsafe
+      put _in_open(pIndex) into tH
+   end unsafe
+   return tH
+end handler
+
+public handler midiOpenOutput(in pIndex as Integer) returns Integer
+   checkABI()
+   variable tH as Integer
+   unsafe
+      put _out_open(pIndex) into tH
+   end unsafe
+   return tH
+end handler
+
+public handler midiOpenVirtualInput(in pName as String) returns Integer
+   checkABI()
+   variable tH as Integer
+   unsafe
+      put _in_open_virtual(pName) into tH
+   end unsafe
+   return tH
+end handler
+
+public handler midiOpenVirtualOutput(in pName as String) returns Integer
+   checkABI()
+   variable tH as Integer
+   unsafe
+      put _out_open_virtual(pName) into tH
+   end unsafe
+   return tH
+end handler
+
+public handler midiClose(in pHandle as Integer)
+   unsafe
+      _close(pHandle)
+   end unsafe
+end handler
+
+public handler midiIgnoreTypes(in pHandle as Integer, in pSysex as Boolean, in pTime as Boolean, in pSense as Boolean)
+   unsafe
+      _in_ignore(pHandle, bi(pSysex), bi(pTime), bi(pSense))
+   end unsafe
+end handler
+
+private handler bi(in pB as Boolean) returns Integer
+   if pB then
+      return 1
+   end if
+   return 0
+end handler
+
+-- =====================================================================
+-- Sending: raw + convenience
+-- =====================================================================
+public handler midiSend(in pHandle as Integer, in pBytes as Data)
+   unsafe
+      _out_send(pHandle, pBytes, the number of bytes in pBytes)
+   end unsafe
+end handler
+
+-- Pack up to three bytes into Data and send.
+private handler send3(in pHandle as Integer, in pStatus as Integer, in pD1 as Integer, in pD2 as Integer, in pLen as Integer)
+   variable tMsg as Data
+   put numToByte(pStatus) into tMsg
+   if pLen >= 2 then
+      put numToByte(pD1) after tMsg
+   end if
+   if pLen >= 3 then
+      put numToByte(pD2) after tMsg
+   end if
+   midiSend(pHandle, tMsg)
+end handler
+
+public handler midiNoteOn(in pHandle as Integer, in pChannel as Integer, in pNote as Integer, in pVelocity as Integer)
+   send3(pHandle, 144 + ((pChannel - 1) mod 16), pNote, pVelocity, 3)
+end handler
+
+public handler midiNoteOff(in pHandle as Integer, in pChannel as Integer, in pNote as Integer, in pVelocity as Integer)
+   send3(pHandle, 128 + ((pChannel - 1) mod 16), pNote, pVelocity, 3)
+end handler
+
+public handler midiControlChange(in pHandle as Integer, in pChannel as Integer, in pController as Integer, in pValue as Integer)
+   send3(pHandle, 176 + ((pChannel - 1) mod 16), pController, pValue, 3)
+end handler
+
+public handler midiProgramChange(in pHandle as Integer, in pChannel as Integer, in pProgram as Integer)
+   send3(pHandle, 192 + ((pChannel - 1) mod 16), pProgram, 0, 2)
+end handler
+
+public handler midiChannelPressure(in pHandle as Integer, in pChannel as Integer, in pValue as Integer)
+   send3(pHandle, 208 + ((pChannel - 1) mod 16), pValue, 0, 2)
+end handler
+
+-- 14-bit pitch bend, 0..16383 (8192 = centre).
+public handler midiPitchBend(in pHandle as Integer, in pChannel as Integer, in pValue14bit as Integer)
+   variable tLsb as Integer
+   variable tMsb as Integer
+   put pValue14bit mod 128 into tLsb
+   put (pValue14bit div 128) mod 128 into tMsb
+   send3(pHandle, 224 + ((pChannel - 1) mod 16), tLsb, tMsb, 3)
+end handler
+
+-- =====================================================================
+-- Receiving: poll + decode
+-- =====================================================================
+-- midiPoll(pHandle) -> List of records, each:
+--   ["delta": <seconds>, "bytes": <Data>, "kind": "noteOn",
+--    "channel": 1, "data1": 60, "data2": 100]
+public handler midiPoll(in pHandle as Integer) returns List
+   ensureDrainBuf()
+   variable tCount as Integer
+   unsafe
+      put _in_drain(pHandle, sDrain, kDrainCap, 256) into tCount
+   end unsafe
+   variable tEvents as List
+   put [] into tEvents
+   if tCount <= 0 then
+      return tEvents
+   end if
+   variable tPos as Integer
+   put 1 into tPos          -- 1-based byte index into sDrain
+   variable k as Integer
+   repeat with k from 1 up to tCount
+      -- [2 bytes len BE]
+      variable tLen as Integer
+      put byteToNum(byte tPos of sDrain) * 256 + byteToNum(byte (tPos + 1) of sDrain) into tLen
+      put tPos + 2 into tPos
+      -- [len bytes message]
+      variable tBytes as Data
+      if tLen > 0 then
+         put byte tPos to (tPos + tLen - 1) of sDrain into tBytes
+      else
+         put the empty data into tBytes
+      end if
+      put tPos + tLen into tPos
+      -- [4 bytes delta micros BE]
+      variable tDeltaUs as Integer
+      put byteToNum(byte tPos of sDrain) * 16777216 \
+        + byteToNum(byte (tPos + 1) of sDrain) * 65536 \
+        + byteToNum(byte (tPos + 2) of sDrain) * 256 \
+        + byteToNum(byte (tPos + 3) of sDrain) into tDeltaUs
+      put tPos + 4 into tPos
+      push decodeEvent(tBytes, tDeltaUs) onto tEvents
+   end repeat
+   return tEvents
+end handler
+
+-- Decode a raw MIDI message + delta into a semantic record.
+private handler decodeEvent(in pBytes as Data, in pDeltaUs as Integer) returns Array
+   variable tRec as Array
+   put (pDeltaUs / 1000000) into tRec["delta"]
+   put pBytes into tRec["bytes"]
+   variable tN as Integer
+   put the number of bytes in pBytes into tN
+   if tN is 0 then
+      put "empty" into tRec["kind"]
+      return tRec
+   end if
+   variable tStatus as Integer
+   put byteToNum(byte 1 of pBytes) into tStatus
+   variable tD1 as Integer
+   variable tD2 as Integer
+   put 0 into tD1
+   put 0 into tD2
+   if tN >= 2 then
+      put byteToNum(byte 2 of pBytes) into tD1
+   end if
+   if tN >= 3 then
+      put byteToNum(byte 3 of pBytes) into tD2
+   end if
+   put tD1 into tRec["data1"]
+   put tD2 into tRec["data2"]
+   if tStatus >= 240 then
+      -- system messages (0xF0..0xFF); SysEx etc.
+      put 0 into tRec["channel"]
+      if tStatus is 240 then
+         put "sysex" into tRec["kind"]
+      else
+         put "system" into tRec["kind"]
+      end if
+      return tRec
+   end if
+   variable tType as Integer
+   put tStatus - (tStatus mod 16) into tType    -- high nibble
+   put (tStatus mod 16) + 1 into tRec["channel"]
+   if tType is 144 then
+      if tD2 is 0 then
+         put "noteOff" into tRec["kind"]      -- note-on velocity 0 == note-off
+      else
+         put "noteOn" into tRec["kind"]
+      end if
+   else if tType is 128 then
+      put "noteOff" into tRec["kind"]
+   else if tType is 176 then
+      put "controlChange" into tRec["kind"]
+   else if tType is 192 then
+      put "programChange" into tRec["kind"]
+   else if tType is 224 then
+      put "pitchBend" into tRec["kind"]
+      put tD1 + tD2 * 128 into tRec["value14"]
+   else if tType is 208 then
+      put "channelPressure" into tRec["kind"]
+   else if tType is 160 then
+      put "polyAftertouch" into tRec["kind"]
+   else
+      put "other" into tRec["kind"]
+   end if
+   return tRec
+end handler
+
+-- =====================================================================
+-- Diagnostics + loader
+-- =====================================================================
+public handler midiLastError() returns String
+   variable tErr as String
+   unsafe
+      put _error_z() into tErr
+   end unsafe
+   return tErr
+end handler
+
+public handler midiLoadNativeLib(in pPath as String) returns Integer
+   variable tHandle as optional Pointer
+   unsafe
+      put _dlopen(pPath, 258) into tHandle
+   end unsafe
+   if tHandle is nothing then
+      return 0
+   end if
+   return 1
+end handler
+
+public handler midiLoadNativeLibError() returns String
+   variable tErr as optional String
+   unsafe
+      put _dlerror() into tErr
+   end unsafe
+   if tErr is nothing then
+      return ""
+   end if
+   return tErr
+end handler

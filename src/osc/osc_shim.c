@@ -1,0 +1,819 @@
+/*
+ * osc_shim.c
+ * ----------------------------------------------------------------------------
+ * The C shim at the heart of ShowControl's OSC extension: an FFI-friendly layer
+ * over tinyosc (ISC) for xTalk Builder (LCB), so OpenXTalk / LiveCode-compatible
+ * engines can build and parse Open Sound Control messages. Transport (the UDP
+ * socket) is owned by the script side -- this shim is a pure, stateless-ish
+ * codec (see README sections 4-5).
+ *
+ * Two tinyosc problems this shim solves (README 5.2):
+ *   1. The write API is variadic -> replaced here with an incremental builder.
+ *   2. The read API is cursor-based AND unchecked -> replaced here with a single
+ *      BOUNDS-CHECKED pre-scan into an indexed model, so malformed datagrams are
+ *      a clean error, never an out-of-bounds read. (We still lean on tinyosc for
+ *      the value decode once the structure is proven safe.)
+ *
+ * Safety: every handle is validated (generation-tagged table) before use, so a
+ * stale/0 handle is a harmless no-op. No library-owned `const char*` ever
+ * crosses the boundary; all string/byte results fill a caller buffer.
+ *
+ * Build: compiled together with tinyosc into ONE shared library named "osc"
+ * (libosc.so / libosc.dylib / osc.dll). See CMakeLists.txt.
+ * ----------------------------------------------------------------------------
+ */
+
+#include "osc_shim.h"
+#include "tinyosc.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdio.h>
+
+/* ===================================================================== */
+/* Last-error string (module-global; the LCB layer exposes oscLastError). */
+/* ===================================================================== */
+static char g_err[256];
+
+static void err_clear(void) { g_err[0] = '\0'; }
+static void err_set(const char *m) {
+    if (!m) { g_err[0] = '\0'; return; }
+    size_t n = strlen(m);
+    if (n >= sizeof g_err) n = sizeof g_err - 1;
+    memcpy(g_err, m, n);
+    g_err[n] = '\0';
+}
+
+/* Copy a NUL-terminated string into a caller buffer using the project-wide
+ * convention: return the length (excluding NUL); -needed if it does not fit;
+ * always NUL-terminate when at least one byte of room exists. */
+static int32_t copy_str(const char *s, char *out, int32_t cap) {
+    int32_t n = (int32_t) strlen(s);
+    if (!out || cap <= 0) return -(n + 1);
+    if (n + 1 > cap) {
+        if (cap > 0) out[0] = '\0';
+        return -(n + 1);
+    }
+    memcpy(out, s, (size_t) n + 1);
+    return n;
+}
+
+/* ===================================================================== */
+/* Portable big-endian store/load (OSC is network byte order throughout).  */
+/* ===================================================================== */
+static void be32_store(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+static void be64_store(uint8_t *p, uint64_t v) {
+    be32_store(p, (uint32_t)(v >> 32));
+    be32_store(p + 4, (uint32_t)v);
+}
+static uint32_t be32_load(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+}
+static uint64_t be64_load(const uint8_t *p) {
+    return ((uint64_t)be32_load(p) << 32) | (uint64_t)be32_load(p + 4);
+}
+static int32_t pad4(int32_t n) { return (n + 3) & ~3; }
+
+/* ===================================================================== */
+/* Generic generation-tagged handle table (compact form of Box2Dxt's).    */
+/* Handle packs an 8-bit generation above a 23-bit slot+1 (never 0).      */
+/* ===================================================================== */
+#define H_SLOT_BITS 23
+#define H_SLOT_MASK 0x7FFFFF
+#define H_GEN_MASK  0xFF
+
+#define DEFINE_PTR_TABLE(NAME, TYPE)                                          \
+    static TYPE         **NAME##_arr  = NULL;                                 \
+    static unsigned char *NAME##_used = NULL;                                 \
+    static unsigned char *NAME##_gen  = NULL;                                 \
+    static int NAME##_cap = 0, NAME##_cnt = 0;                                \
+    static int *NAME##_free = NULL; static int NAME##_freeCap=0,NAME##_freeCnt=0;\
+    static int NAME##_grow(int nc) {                                          \
+        TYPE **na = (TYPE**)realloc(NAME##_arr, (size_t)nc*sizeof(TYPE*));    \
+        if(!na) { return 0; } NAME##_arr = na;                                    \
+        unsigned char *nu=(unsigned char*)realloc(NAME##_used,(size_t)nc);    \
+        if(!nu) { return 0; } NAME##_used = nu;                                   \
+        unsigned char *ng=(unsigned char*)realloc(NAME##_gen,(size_t)nc);     \
+        if(!ng) { return 0; } NAME##_gen = ng;                                    \
+        memset(NAME##_used+NAME##_cap,0,(size_t)(nc-NAME##_cap));             \
+        memset(NAME##_gen +NAME##_cap,0,(size_t)(nc-NAME##_cap));             \
+        NAME##_cap = nc; return 1;                                            \
+    }                                                                         \
+    static int NAME##_encode(int idx){                                        \
+        return (int)(((unsigned)NAME##_gen[idx]<<H_SLOT_BITS)|(unsigned)(idx+1));\
+    }                                                                         \
+    static int NAME##_slot(int h){                                            \
+        if(h<=0) return -1;                                                   \
+        int idx=(h & H_SLOT_MASK)-1;                                          \
+        unsigned gen=((unsigned)h>>H_SLOT_BITS)&H_GEN_MASK;                   \
+        if(idx<0||idx>=NAME##_cnt) return -1;                                 \
+        if(!NAME##_used[idx]||NAME##_gen[idx]!=gen) return -1;                \
+        return idx;                                                           \
+    }                                                                         \
+    static int NAME##_add(TYPE *v){                                           \
+        int idx=-1;                                                           \
+        if(NAME##_freeCnt>0) idx=NAME##_free[--NAME##_freeCnt];               \
+        if(idx<0){                                                            \
+            if(NAME##_cnt>=H_SLOT_MASK-1) return 0;                           \
+            if(NAME##_cnt>=NAME##_cap){                                       \
+                int nc=NAME##_cap?NAME##_cap*2:32;                            \
+                if(!NAME##_grow(nc)) return 0;                                \
+            }                                                                 \
+            idx=NAME##_cnt++;                                                 \
+        }                                                                     \
+        NAME##_arr[idx]=v; NAME##_used[idx]=1;                                \
+        return NAME##_encode(idx);                                            \
+    }                                                                         \
+    static TYPE *NAME##_get(int h){                                           \
+        int idx=NAME##_slot(h); return idx<0?NULL:NAME##_arr[idx];           \
+    }                                                                         \
+    static int NAME##_release(int h){                                        \
+        int idx=NAME##_slot(h); if(idx<0) return 0;                          \
+        NAME##_arr[idx]=NULL; NAME##_used[idx]=0;                            \
+        NAME##_gen[idx]=(unsigned char)((NAME##_gen[idx]+1)&H_GEN_MASK);      \
+        if(NAME##_freeCnt>=NAME##_freeCap){                                   \
+            int nc=NAME##_freeCap?NAME##_freeCap*2:32;                        \
+            int *nf=(int*)realloc(NAME##_free,(size_t)nc*sizeof(int));        \
+            if(nf){NAME##_free=nf;NAME##_freeCap=nc;}                         \
+        }                                                                     \
+        if(NAME##_freeCnt<NAME##_freeCap) NAME##_free[NAME##_freeCnt++]=idx;  \
+        return 1;                                                             \
+    }
+
+/* ===================================================================== */
+/* Builder model                                                          */
+/* ===================================================================== */
+typedef struct {
+    char    type;            /* OSC type tag char */
+    int64_t i;               /* i/h/t integer payloads */
+    double  d;               /* f/d float payloads (stored wide, narrowed at write) */
+    uint8_t *bytes;          /* s (with NUL) / b payload, owned */
+    int32_t  blen;           /* byte length of `bytes` for blob; strlen for string */
+} build_arg;
+
+typedef struct {
+    char       *address;     /* owned, NUL-terminated */
+    build_arg  *args;
+    int32_t     count, cap;
+    int         ok;          /* 0 once an append failed (OOM / bad input) */
+} builder;
+
+DEFINE_PTR_TABLE(builders, builder)
+
+static builder *builder_of(int32_t h) { return builders_get(h); }
+
+static int builder_reserve(builder *b) {
+    if (b->count >= b->cap) {
+        int32_t nc = b->cap ? b->cap * 2 : 8;
+        build_arg *na = (build_arg*) realloc(b->args, (size_t)nc * sizeof(build_arg));
+        if (!na) { b->ok = 0; return 0; }
+        b->args = na; b->cap = nc;
+    }
+    return 1;
+}
+
+OSC_API int32_t osc_build_new(const char *address) {
+    err_clear();
+    if (!address) { err_set("oscBuildMessage: nil address"); return 0; }
+    builder *b = (builder*) calloc(1, sizeof(builder));
+    if (!b) { err_set("out of memory"); return 0; }
+    size_t n = strlen(address);
+    b->address = (char*) malloc(n + 1);
+    if (!b->address) { free(b); err_set("out of memory"); return 0; }
+    memcpy(b->address, address, n + 1);
+    b->ok = 1;
+    int32_t h = builders_add(b);
+    if (!h) { free(b->address); free(b); err_set("handle table full"); return 0; }
+    return h;
+}
+
+static int32_t build_scalar(int32_t h, char type, int64_t i, double d) {
+    builder *b = builder_of(h);
+    if (!b) return 0;
+    if (!builder_reserve(b)) return 0;
+    build_arg *a = &b->args[b->count++];
+    memset(a, 0, sizeof *a);
+    a->type = type; a->i = i; a->d = d;
+    return 1;
+}
+
+OSC_API int32_t osc_build_add_int32 (int32_t h, int32_t v){ return build_scalar(h,'i',v,0); }
+OSC_API int32_t osc_build_add_int64 (int32_t h, int64_t v){ return build_scalar(h,'h',v,0); }
+OSC_API int32_t osc_build_add_float (int32_t h, float v)  { return build_scalar(h,'f',0,(double)v); }
+OSC_API int32_t osc_build_add_double(int32_t h, double v) { return build_scalar(h,'d',0,v); }
+OSC_API int32_t osc_build_add_true   (int32_t h){ return build_scalar(h,'T',0,0); }
+OSC_API int32_t osc_build_add_false  (int32_t h){ return build_scalar(h,'F',0,0); }
+OSC_API int32_t osc_build_add_nil    (int32_t h){ return build_scalar(h,'N',0,0); }
+OSC_API int32_t osc_build_add_impulse(int32_t h){ return build_scalar(h,'I',0,0); }
+OSC_API int32_t osc_build_add_timetag(int32_t h, uint64_t ntp){ return build_scalar(h,'t',(int64_t)ntp,0); }
+
+OSC_API int32_t osc_build_add_int64_str(int32_t h, const char *dec) {
+    int64_t v = dec ? (int64_t) strtoll(dec, NULL, 10) : 0;
+    return build_scalar(h, 'h', v, 0);
+}
+OSC_API int32_t osc_build_add_timetag_str(int32_t h, const char *dec) {
+    uint64_t v = dec ? (uint64_t) strtoull(dec, NULL, 10) : 0;
+    return build_scalar(h, 't', (int64_t) v, 0);
+}
+
+OSC_API int32_t osc_build_add_string(int32_t h, const char *v) {
+    builder *b = builder_of(h);
+    if (!b) return 0;
+    if (!v) v = "";
+    if (!builder_reserve(b)) return 0;
+    build_arg *a = &b->args[b->count++];
+    memset(a, 0, sizeof *a);
+    a->type = 's';
+    int32_t n = (int32_t) strlen(v);
+    a->bytes = (uint8_t*) malloc((size_t)n + 1);
+    if (!a->bytes) { b->count--; b->ok = 0; return 0; }
+    memcpy(a->bytes, v, (size_t)n + 1);
+    a->blen = n;
+    return 1;
+}
+
+OSC_API int32_t osc_build_add_blob(int32_t h, const uint8_t *data, int32_t len) {
+    builder *b = builder_of(h);
+    if (!b) return 0;
+    if (len < 0) len = 0;
+    if (!builder_reserve(b)) return 0;
+    build_arg *a = &b->args[b->count++];
+    memset(a, 0, sizeof *a);
+    a->type = 'b';
+    a->bytes = (uint8_t*) malloc((size_t)(len > 0 ? len : 1));
+    if (!a->bytes) { b->count--; b->ok = 0; return 0; }
+    if (len > 0 && data) memcpy(a->bytes, data, (size_t)len);
+    a->blen = len;
+    return 1;
+}
+
+/* Compute the exact serialized size of the current builder, or -1 on bad model. */
+static int32_t builder_size(builder *b) {
+    int32_t sz = pad4((int32_t)strlen(b->address) + 1);   /* address + NUL, padded */
+    sz += pad4(b->count + 2);                              /* ',' + tags + NUL, padded */
+    for (int32_t k = 0; k < b->count; k++) {
+        build_arg *a = &b->args[k];
+        switch (a->type) {
+            case 'i': case 'f': sz += 4; break;
+            case 'h': case 'd': case 't': sz += 8; break;
+            case 's': sz += pad4(a->blen + 1); break;
+            case 'b': sz += 4 + pad4(a->blen); break;
+            case 'T': case 'F': case 'N': case 'I': break;
+            default: return -1;
+        }
+    }
+    return sz;
+}
+
+OSC_API int32_t osc_build_finish(int32_t h, uint8_t *out, int32_t out_cap) {
+    err_clear();
+    builder *b = builder_of(h);
+    if (!b) { err_set("oscBuildMessage: bad builder handle"); return 0; }
+    if (!b->ok) { err_set("oscBuildMessage: builder in error state (OOM?)"); return 0; }
+    int32_t need = builder_size(b);
+    if (need < 0) { err_set("oscBuildMessage: bad argument type"); return 0; }
+    if (!out || out_cap < need) return -need;
+
+    memset(out, 0, (size_t)need);
+    int32_t i = 0;
+    int32_t alen = (int32_t) strlen(b->address);
+    memcpy(out + i, b->address, (size_t)alen);
+    i = pad4(alen + 1);
+
+    out[i++] = ',';
+    for (int32_t k = 0; k < b->count; k++) out[i++] = (uint8_t) b->args[k].type;
+    i = pad4(i);                       /* pad past the typetag NUL run */
+
+    for (int32_t k = 0; k < b->count; k++) {
+        build_arg *a = &b->args[k];
+        switch (a->type) {
+            case 'i': be32_store(out + i, (uint32_t)(int32_t)a->i); i += 4; break;
+            case 'h': be64_store(out + i, (uint64_t)a->i); i += 8; break;
+            case 't': be64_store(out + i, (uint64_t)a->i); i += 8; break;
+            case 'f': { float f = (float)a->d; uint32_t bits; memcpy(&bits,&f,4);
+                        be32_store(out + i, bits); i += 4; break; }
+            case 'd': { double dd = a->d; uint64_t bits; memcpy(&bits,&dd,8);
+                        be64_store(out + i, bits); i += 8; break; }
+            case 's': { memcpy(out + i, a->bytes, (size_t)a->blen);
+                        i = pad4(i + a->blen + 1); break; }
+            case 'b': { be32_store(out + i, (uint32_t)a->blen); i += 4;
+                        if (a->blen) memcpy(out + i, a->bytes, (size_t)a->blen);
+                        i = pad4(i + a->blen); break; }
+            default: break; /* T F N I: tag only */
+        }
+    }
+    return need;
+}
+
+static void builder_destroy(builder *b) {
+    if (!b) return;
+    for (int32_t k = 0; k < b->count; k++) free(b->args[k].bytes);
+    free(b->args); free(b->address); free(b);
+}
+
+OSC_API void osc_build_free(int32_t h) {
+    builder *b = builder_of(h);
+    if (b) { builders_release(h); builder_destroy(b); }
+}
+
+/* ===================================================================== */
+/* Bundle builder: a growable byte buffer assembled from finished messages.*/
+/* ===================================================================== */
+typedef struct {
+    uint8_t *buf;
+    int32_t  len, cap;
+    uint64_t timetag;
+    int      ok;
+} bundle_builder;
+
+DEFINE_PTR_TABLE(bundles, bundle_builder)
+
+static int bundle_reserve(bundle_builder *b, int32_t extra) {
+    if (b->len + extra > b->cap) {
+        int32_t nc = b->cap ? b->cap * 2 : 64;
+        while (nc < b->len + extra) nc *= 2;
+        uint8_t *nb = (uint8_t*) realloc(b->buf, (size_t)nc);
+        if (!nb) { b->ok = 0; return 0; }
+        b->buf = nb; b->cap = nc;
+    }
+    return 1;
+}
+
+OSC_API int32_t osc_bundle_new(uint64_t timetag) {
+    err_clear();
+    bundle_builder *b = (bundle_builder*) calloc(1, sizeof(bundle_builder));
+    if (!b) { err_set("out of memory"); return 0; }
+    b->timetag = timetag; b->ok = 1;
+    int32_t h = bundles_add(b);
+    if (!h) { free(b); err_set("handle table full"); return 0; }
+    return h;
+}
+OSC_API int32_t osc_bundle_new_str(const char *dec) {
+    uint64_t t = (dec && dec[0]) ? (uint64_t) strtoull(dec, NULL, 10) : 1u;
+    return osc_bundle_new(t);
+}
+
+OSC_API int32_t osc_bundle_add_message(int32_t h, const uint8_t *msg, int32_t len) {
+    bundle_builder *b = bundles_get(h);
+    if (!b) return 0;
+    if (len < 0 || !msg) { b->ok = 0; return 0; }
+    if (!bundle_reserve(b, 4 + len)) return 0;
+    be32_store(b->buf + b->len, (uint32_t)len);   /* element size prefix */
+    b->len += 4;
+    memcpy(b->buf + b->len, msg, (size_t)len);
+    b->len += len;
+    return 1;
+}
+
+OSC_API int32_t osc_bundle_finish(int32_t h, uint8_t *out, int32_t out_cap) {
+    err_clear();
+    bundle_builder *b = bundles_get(h);
+    if (!b) { err_set("oscBuildBundle: bad handle"); return 0; }
+    if (!b->ok) { err_set("oscBuildBundle: bundle in error state"); return 0; }
+    int32_t need = 16 + b->len;                   /* "#bundle\0" + timetag + elements */
+    if (!out || out_cap < need) return -need;
+    memcpy(out, "#bundle", 7); out[7] = '\0';
+    be64_store(out + 8, b->timetag);
+    if (b->len) memcpy(out + 16, b->buf, (size_t)b->len);
+    return need;
+}
+
+OSC_API void osc_bundle_free(int32_t h) {
+    bundle_builder *b = bundles_get(h);
+    if (b) { bundles_release(h); free(b->buf); free(b); }
+}
+
+/* ===================================================================== */
+/* Parsed model: a bounds-checked indexed view of a datagram.             */
+/* ===================================================================== */
+typedef struct {
+    char     type;
+    int64_t  i;        /* i/h/t */
+    double   d;        /* f/d */
+    int32_t  off;      /* s/b: offset into owned `data` */
+    int32_t  len;      /* s/b: byte length (string excludes the NUL) */
+} parsed_arg;
+
+typedef struct parsed_msg {
+    int          is_bundle;
+    uint64_t     timetag;
+    /* message: */
+    uint8_t     *data;        /* owned copy of this message's bytes */
+    int32_t      data_len;
+    char        *address;     /* points into data */
+    char        *typetag;     /* malloc'd "fsi" (no comma), NUL-terminated */
+    parsed_arg  *args;
+    int32_t      argc;
+    /* bundle: */
+    int32_t     *children;    /* handles of sub-messages */
+    int32_t      child_count;
+} parsed_msg;
+
+DEFINE_PTR_TABLE(parsed, parsed_msg)
+
+/* Forward decls */
+static int32_t parse_message_bytes(const uint8_t *data, int32_t len);
+static int32_t parse_bundle_bytes(const uint8_t *data, int32_t len);
+static void parsed_destroy(int32_t h);
+
+OSC_API int32_t osc_parse(const uint8_t *data, int32_t len) {
+    err_clear();
+    if (!data || len < 4) { err_set("oscParse: datagram too short"); return 0; }
+    if (len & 3) { err_set("oscParse: length not a multiple of 4"); return 0; }
+    if (len >= 8 && memcmp(data, "#bundle", 7) == 0 && data[7] == '\0')
+        return parse_bundle_bytes(data, len);
+    if (data[0] != '/') { err_set("oscParse: address must start with '/'"); return 0; }
+    return parse_message_bytes(data, len);
+}
+
+/* ---------------------------------------------------------------------------
+ * Bounds-safe VALIDATOR. tinyosc's cursor reader (tosc_getNext*) does NOT
+ * bounds-check, which is unacceptable for untrusted network input. So before
+ * we let tinyosc touch a datagram we prove, here, that every field lies inside
+ * `len`. On success it reports the type-tag span so the caller can size its
+ * model; tinyosc then does the actual decode over already-proven-safe bytes.
+ * Returns 0 on success (filling the tt_start, ntags and arg_pos outs), else -1.
+ * ------------------------------------------------------------------------- */
+static int validate_message(const uint8_t *data, int32_t len,
+                            int32_t *tt_start, int32_t *ntags, int32_t *arg_pos) {
+    int32_t i = 0;
+    while (i < len && data[i] != '\0') i++;                 /* address NUL */
+    if (i >= len) { err_set("oscParse: address not terminated"); return -1; }
+    i = pad4(i + 1);
+    if (i >= len || data[i] != ',') { err_set("oscParse: missing type tag"); return -1; }
+    int32_t ts = i + 1, j = ts;
+    while (j < len && data[j] != '\0') j++;                 /* type tag NUL */
+    if (j >= len) { err_set("oscParse: type tag not terminated"); return -1; }
+    int32_t nt = j - ts;
+    int32_t p = pad4(j + 1);
+    if (p > len) { err_set("oscParse: truncated after type tag"); return -1; }
+
+    for (int32_t k = 0; k < nt; k++) {
+        switch (data[ts + k]) {
+            case 'i': case 'f':
+                if (p + 4 > len) { goto trunc; } p += 4; break;
+            case 'h': case 't': case 'd':
+                if (p + 8 > len) { goto trunc; } p += 8; break;
+            case 's': {
+                int32_t s = p;
+                while (p < len && data[p] != '\0') p++;
+                if (p >= len) goto trunc;
+                p = pad4(p + 1);
+                if (p > len) goto trunc;
+                (void) s; break; }
+            case 'b': {
+                if (p + 4 > len) goto trunc;
+                int32_t bl = (int32_t) be32_load(data + p);
+                if (bl < 0 || p + 4 + bl > len) goto trunc;
+                p = pad4(p + 4 + bl);
+                if (p > len) goto trunc;
+                break; }
+            case 'T': case 'F': case 'N': case 'I':
+                break;
+            default:
+                err_set("oscParse: unknown type tag"); return -1;
+        }
+    }
+    *tt_start = ts; *ntags = nt; *arg_pos = pad4(j + 1);
+    return 0;
+trunc:
+    err_set("oscParse: truncated / malformed argument data");
+    return -1;
+}
+
+/* Validate, then DECODE through tinyosc into the indexed model. */
+static int32_t parse_message_bytes(const uint8_t *data, int32_t len) {
+    int32_t tt_start = 0, ntags = 0, arg_pos = 0;
+    if (validate_message(data, len, &tt_start, &ntags, &arg_pos) != 0)
+        return 0;
+
+    parsed_msg *m = (parsed_msg*) calloc(1, sizeof(parsed_msg));
+    if (!m) { err_set("out of memory"); return 0; }
+    m->data = (uint8_t*) malloc((size_t)len);
+    m->typetag = (char*) malloc((size_t)ntags + 1);
+    m->args = ntags ? (parsed_arg*) calloc((size_t)ntags, sizeof(parsed_arg)) : NULL;
+    if (!m->data || !m->typetag || (ntags && !m->args)) {
+        free(m->data); free(m->typetag); free(m->args); free(m);
+        err_set("out of memory"); return 0;
+    }
+    memcpy(m->data, data, (size_t)len);
+    m->data_len = len;
+    m->address = (char*) m->data;
+    memcpy(m->typetag, data + tt_start, (size_t)ntags);
+    m->typetag[ntags] = '\0';
+
+    /* tinyosc decode -- safe now that validate_message proved every field. */
+    tosc_message tm;
+    tosc_parseMessage(&tm, (char*) m->data, len);
+    for (int32_t k = 0; k < ntags; k++) {
+        char t = m->typetag[k];
+        parsed_arg *a = &m->args[k];
+        a->type = t;
+        switch (t) {
+            case 'i': a->i = tosc_getNextInt32(&tm);  break;
+            case 'h': a->i = tosc_getNextInt64(&tm);  break;
+            case 't': a->i = (int64_t) tosc_getNextTimetag(&tm); break;
+            case 'f': a->d = (double) tosc_getNextFloat(&tm);    break;
+            case 'd': a->d = tosc_getNextDouble(&tm); break;
+            case 's': {
+                const char *s = tosc_getNextString(&tm);
+                a->off = (int32_t)((const uint8_t*) s - m->data);
+                a->len = (int32_t) strlen(s);
+                break; }
+            case 'b': {
+                const char *bp = NULL; int bl = 0;
+                tosc_getNextBlob(&tm, &bp, &bl);
+                a->off = (int32_t)((const uint8_t*) bp - m->data);
+                a->len = bl;
+                break; }
+            default: break; /* T F N I */
+        }
+    }
+    m->argc = ntags;
+    m->is_bundle = 0;
+
+    int32_t h = parsed_add(m);
+    if (!h) { free(m->data); free(m->typetag); free(m->args); free(m);
+              err_set("handle table full"); return 0; }
+    return h;
+}
+
+/* Validate + index a bundle, recursing into its elements. */
+static int32_t parse_bundle_bytes(const uint8_t *data, int32_t len) {
+    if (len < 16) { err_set("oscParse: bundle too short"); return 0; }
+    parsed_msg *m = (parsed_msg*) calloc(1, sizeof(parsed_msg));
+    if (!m) { err_set("out of memory"); return 0; }
+    m->is_bundle = 1;
+    m->timetag = be64_load(data + 8);
+
+    int32_t cap = 0;
+    int32_t p = 16;
+    while (p + 4 <= len) {
+        int32_t elen = (int32_t) be32_load(data + p);
+        p += 4;
+        if (elen < 0 || p + elen > len) { err_set("oscParse: bad bundle element size"); goto bad; }
+        int32_t child = osc_parse(data + p, elen);   /* recurse (handles nesting) */
+        if (!child) goto bad;                          /* err already set */
+        if (m->child_count >= cap) {
+            int32_t nc = cap ? cap * 2 : 4;
+            int32_t *nn = (int32_t*) realloc(m->children, (size_t)nc * sizeof(int32_t));
+            if (!nn) { osc_parse_free(child); err_set("out of memory"); goto bad; }
+            m->children = nn; cap = nc;
+        }
+        m->children[m->child_count++] = child;
+        p += elen;
+    }
+    {
+        int32_t h = parsed_add(m);
+        if (!h) { err_set("handle table full"); goto bad; }
+        return h;
+    }
+bad:
+    for (int32_t k = 0; k < m->child_count; k++) osc_parse_free(m->children[k]);
+    free(m->children); free(m);
+    return 0;
+}
+
+OSC_API int32_t osc_is_bundle(int32_t h) {
+    parsed_msg *m = parsed_get(h); return m ? m->is_bundle : 0;
+}
+OSC_API uint64_t osc_bundle_timetag(int32_t h) {
+    parsed_msg *m = parsed_get(h); return (m && m->is_bundle) ? m->timetag : 0;
+}
+OSC_API int32_t osc_bundle_count(int32_t h) {
+    parsed_msg *m = parsed_get(h); return (m && m->is_bundle) ? m->child_count : 0;
+}
+OSC_API int32_t osc_bundle_message(int32_t h, int32_t i) {
+    parsed_msg *m = parsed_get(h);
+    if (!m || !m->is_bundle || i < 0 || i >= m->child_count) return 0;
+    return m->children[i];
+}
+
+OSC_API int32_t osc_address(int32_t h, char *out, int32_t out_cap) {
+    parsed_msg *m = parsed_get(h);
+    if (!m || m->is_bundle || !m->address) { if (out && out_cap>0) out[0]='\0'; return 0; }
+    return copy_str(m->address, out, out_cap);
+}
+OSC_API int32_t osc_typetag(int32_t h, char *out, int32_t out_cap) {
+    parsed_msg *m = parsed_get(h);
+    if (!m || m->is_bundle || !m->typetag) { if (out && out_cap>0) out[0]='\0'; return 0; }
+    return copy_str(m->typetag, out, out_cap);
+}
+OSC_API int32_t osc_arg_count(int32_t h) {
+    parsed_msg *m = parsed_get(h); return (m && !m->is_bundle) ? m->argc : 0;
+}
+OSC_API int32_t osc_arg_type(int32_t h, int32_t i) {
+    parsed_msg *m = parsed_get(h);
+    if (!m || m->is_bundle || i < 0 || i >= m->argc) return 0;
+    return (int32_t)(unsigned char) m->args[i].type;
+}
+
+static parsed_arg *arg_at(int32_t h, int32_t i) {
+    parsed_msg *m = parsed_get(h);
+    if (!m || m->is_bundle || i < 0 || i >= m->argc) return NULL;
+    return &m->args[i];
+}
+
+OSC_API int32_t osc_arg_int32(int32_t h, int32_t i, int32_t *ok) {
+    parsed_arg *a = arg_at(h, i);
+    if (a && (a->type=='i' || a->type=='h')) { if(ok)*ok=1; return (int32_t)a->i; }
+    if (a && a->type=='f') { if(ok)*ok=1; return (int32_t)a->d; }
+    if (a && a->type=='d') { if(ok)*ok=1; return (int32_t)a->d; }
+    if (ok) { *ok = 0; } return 0;
+}
+OSC_API int64_t osc_arg_int64(int32_t h, int32_t i, int32_t *ok) {
+    parsed_arg *a = arg_at(h, i);
+    if (a && (a->type=='i' || a->type=='h' || a->type=='t')) { if(ok)*ok=1; return a->i; }
+    if (ok) { *ok = 0; } return 0;
+}
+OSC_API float osc_arg_float(int32_t h, int32_t i, int32_t *ok) {
+    parsed_arg *a = arg_at(h, i);
+    if (a && (a->type=='f' || a->type=='d')) { if(ok)*ok=1; return (float)a->d; }
+    if (a && (a->type=='i' || a->type=='h')) { if(ok)*ok=1; return (float)a->i; }
+    if (ok) { *ok = 0; } return 0.0f;
+}
+OSC_API double osc_arg_double(int32_t h, int32_t i, int32_t *ok) {
+    parsed_arg *a = arg_at(h, i);
+    if (a && (a->type=='f' || a->type=='d')) { if(ok)*ok=1; return a->d; }
+    if (a && (a->type=='i' || a->type=='h')) { if(ok)*ok=1; return (double)a->i; }
+    if (ok) { *ok = 0; } return 0.0;
+}
+OSC_API uint64_t osc_arg_timetag(int32_t h, int32_t i, int32_t *ok) {
+    parsed_arg *a = arg_at(h, i);
+    if (a && (a->type=='t' || a->type=='h')) { if(ok)*ok=1; return (uint64_t)a->i; }
+    if (ok) { *ok = 0; } return 0;
+}
+OSC_API int32_t osc_arg_string(int32_t h, int32_t i, char *out, int32_t out_cap) {
+    parsed_arg *a = arg_at(h, i);
+    parsed_msg *m = parsed_get(h);
+    if (!a || a->type != 's') return -1;
+    int32_t n = a->len;
+    if (!out || out_cap < n + 1) return -(n + 1);
+    memcpy(out, m->data + a->off, (size_t)n);
+    out[n] = '\0';
+    return n;
+}
+OSC_API int32_t osc_arg_blob(int32_t h, int32_t i, uint8_t *out, int32_t out_cap) {
+    parsed_arg *a = arg_at(h, i);
+    parsed_msg *m = parsed_get(h);
+    if (!a || a->type != 'b') return -1;
+    int32_t n = a->len;
+    if (!out || out_cap < n) return -n;
+    if (n) memcpy(out, m->data + a->off, (size_t)n);
+    return n;
+}
+
+OSC_API int32_t osc_arg_int64_str(int32_t h, int32_t i, char *out, int32_t out_cap) {
+    parsed_arg *a = arg_at(h, i);
+    if (!a || (a->type != 'h' && a->type != 'i' && a->type != 't')) return -1;
+    char tmp[24];
+    int n = snprintf(tmp, sizeof tmp, "%" PRId64, a->i);
+    (void) n;
+    return copy_str(tmp, out, out_cap);
+}
+OSC_API int32_t osc_bundle_timetag_str(int32_t h, char *out, int32_t out_cap) {
+    parsed_msg *m = parsed_get(h);
+    if (!m || !m->is_bundle) return -1;
+    char tmp[24];
+    snprintf(tmp, sizeof tmp, "%" PRIu64, m->timetag);
+    return copy_str(tmp, out, out_cap);
+}
+
+static void parsed_destroy(int32_t h) {
+    parsed_msg *m = parsed_get(h);
+    if (!m) return;
+    parsed_release(h);
+    for (int32_t k = 0; k < m->child_count; k++) parsed_destroy(m->children[k]);
+    free(m->children);
+    free(m->args);
+    free(m->typetag);
+    free(m->data);
+    free(m);
+}
+OSC_API void osc_parse_free(int32_t h) { parsed_destroy(h); }
+
+/* ===================================================================== */
+/* OSC 1.0 address pattern matching: ? * [ ] [!] [a-z] { , }              */
+/* Reference grammar from the OSC 1.0 spec, recursive matcher.            */
+/* ===================================================================== */
+static int match_here(const char *p, const char *s);
+
+/* match a [ ... ] character class at p (p points just after '[') against s[0] */
+static int match_class(const char **pp, char c) {
+    const char *p = *pp;
+    int negate = 0, matched = 0;
+    if (*p == '!') { negate = 1; p++; }
+    while (*p && *p != ']') {
+        if (p[1] == '-' && p[2] && p[2] != ']') {
+            char lo = p[0], hi = p[2];
+            if ((unsigned char)c >= (unsigned char)lo && (unsigned char)c <= (unsigned char)hi) matched = 1;
+            p += 3;
+        } else {
+            if (*p == c) matched = 1;
+            p++;
+        }
+    }
+    if (*p == ']') p++;
+    *pp = p;
+    return negate ? !matched : matched;
+}
+
+/* match a { a, bb, ccc } alternation at p (p points just after '{') */
+static int match_alt(const char *p, const char *s, const char **p_after) {
+    /* find the matching close brace to know where the pattern resumes */
+    const char *q = p; int depth = 1;
+    while (*q && depth) { if (*q=='{') depth++; else if (*q=='}') depth--; if (depth) q++; }
+    const char *after = (*q == '}') ? q + 1 : q;   /* pattern continues after '}' */
+    *p_after = after;
+
+    const char *opt = p;
+    while (opt < q) {
+        const char *e = opt;
+        while (e < q && *e != ',') e++;
+        int32_t L = (int32_t)(e - opt);
+        if (strncmp(s, opt, (size_t)L) == 0 && match_here(after, s + L)) return 1;
+        opt = (e < q) ? e + 1 : e;
+    }
+    return 0;
+}
+
+static int match_here(const char *p, const char *s) {
+    while (*p) {
+        if (*p == '?') {
+            if (*s == '\0' || *s == '/') return 0;
+            p++; s++;
+        } else if (*p == '*') {
+            p++;
+            if (*p == '\0') {                 /* trailing star: match to end of segment */
+                while (*s && *s != '/') s++;
+                return *s == '\0';
+            }
+            for (;;) {
+                if (match_here(p, s)) return 1;
+                if (*s == '\0' || *s == '/') return 0;
+                s++;
+            }
+        } else if (*p == '[') {
+            p++;
+            if (*s == '\0' || *s == '/') return 0;
+            if (!match_class(&p, *s)) return 0;
+            s++;
+        } else if (*p == '{') {
+            const char *after;
+            return match_alt(p + 1, s, &after);
+        } else {
+            if (*p != *s) return 0;
+            p++; s++;
+        }
+    }
+    return *s == '\0';
+}
+
+OSC_API int32_t osc_match(const char *pattern, const char *address) {
+    if (!pattern || !address) return 0;
+    return match_here(pattern, address) ? 1 : 0;
+}
+
+/* ---- ZStringUTF8 convenience accessors (model-owned lifetime) ---------- */
+OSC_API const char *osc_address_str(int32_t h) {
+    parsed_msg *m = parsed_get(h);
+    return (m && !m->is_bundle && m->address) ? m->address : "";
+}
+OSC_API const char *osc_typetag_str(int32_t h) {
+    parsed_msg *m = parsed_get(h);
+    return (m && !m->is_bundle && m->typetag) ? m->typetag : "";
+}
+OSC_API const char *osc_error_str(void) { return g_err; }
+OSC_API const char *osc_arg_string_z(int32_t h, int32_t i) {
+    parsed_arg *a = arg_at(h, i);
+    parsed_msg *m = parsed_get(h);
+    if (!a || a->type != 's' || !m) return "";
+    return (const char*)(m->data + a->off);   /* NUL-terminated in the buffer */
+}
+OSC_API const char *osc_arg_int64_z(int32_t h, int32_t i) {
+    static char z[24];
+    parsed_arg *a = arg_at(h, i);
+    if (!a || (a->type != 'h' && a->type != 'i' && a->type != 't')) return "";
+    snprintf(z, sizeof z, "%" PRId64, a->i);
+    return z;
+}
+OSC_API const char *osc_bundle_timetag_z(int32_t h) {
+    static char z[24];
+    parsed_msg *m = parsed_get(h);
+    if (!m || !m->is_bundle) return "";
+    snprintf(z, sizeof z, "%" PRIu64, m->timetag);
+    return z;
+}
+
+/* ===================================================================== */
+OSC_API int32_t osc_abi_version(void) { return OSC_ABI_VERSION; }
+
+OSC_API int32_t osc_last_error(char *out, int32_t out_cap) {
+    return copy_str(g_err, out, out_cap);
+}

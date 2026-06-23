@@ -1,0 +1,149 @@
+name: build
+
+# Builds the ShowControl native shims (osc, midi) and runs every gate for each
+# supported target, then attaches the binaries to a published GitHub Release.
+# The Art-Net extension is pure LCB -- it has no native build; its wire format is
+# gated by the Python golden-packet test in the `static` job below.
+#
+# Targets (osc has no external deps; midi links the platform MIDI backend):
+#   linux-x86_64    64-bit, manylinux2014 container -> glibc 2.17 floor
+#   linux-i686      32-bit, manylinux2014 container (OSC only; see note)
+#   macos-universal arm64 + x86_64 in one dylib
+#   windows-x64 / windows-x86   MSVC
+#
+# Triggers: pushes to main and PRs build + test (no attach); a published Release
+# builds + attaches; a manual run with release_tag attaches after the fact.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  release:
+    types: [ published ]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Attach built binaries to this existing release tag. Blank = build & test only."
+        required: false
+        default: ""
+
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event.inputs.release_tag }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap gate: static checks on the script layer (OXT cannot compile LCB in CI),
+  # the Art-Net golden-packet spec, and an ASan/UBSan run of the C smoke tests
+  # (this is the build that first caught a real null-deref in the MIDI shim).
+  static:
+    name: lint + golden + asan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static .lcb / .livecodescript gates
+        run: python3 tools/check-livecodescript.py
+      - name: Art-Net golden-packet spec
+        run: python3 tests/artnet_golden_test.py
+      - name: ALSA headers (for the MIDI shim)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Build + run the C smoke tests under AddressSanitizer
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+            -DSHOWCONTROL_BUILD_TESTS=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake --build build-asan -j
+          ctest --test-dir build-asan --output-on-failure
+
+  # Linux x86_64 on a modern toolchain. (Maximally-portable glibc-2.17 binaries
+  # via a manylinux container, and 32-bit Linux, are follow-ups -- RtMidi's C++
+  # needs a newer compiler than the manylinux2014 default; tracked in CHANGELOG.)
+  build-linux:
+    name: build & test (linux-x86_64)
+    needs: static
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ALSA headers (for the MIDI shim)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Configure / build / test
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON
+          cmake --build build --config Release
+          ctest --test-dir build --output-on-failure
+      - name: Stage libraries
+        run: |
+          mkdir -p dist
+          cp "$(find build -maxdepth 2 -name osc.so  | head -n1)" dist/osc-linux-x86_64.so
+          cp "$(find build -maxdepth 2 -name midi.so | head -n1)" dist/midi-linux-x86_64.so
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  # macOS + Windows build natively.
+  build-native:
+    name: build & test (${{ matrix.name }})
+    needs: static
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            os: macos-latest
+            cmake_args: '-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"'
+            ext: dylib
+          - name: windows-x64
+            os: windows-latest
+            cmake_args: -A x64
+            ext: dll
+          - name: windows-x86
+            os: windows-latest
+            cmake_args: -A Win32
+            ext: dll
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Smoke test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+      - name: Stage libraries
+        shell: bash
+        run: |
+          mkdir -p dist
+          for lib in osc midi; do
+            src="$(find build -maxdepth 2 -name "${lib}.${{ matrix.ext }}" | head -n1)"
+            test -n "$src" || { echo "missing ${lib}.${{ matrix.ext }}"; exit 1; }
+            cp "$src" "dist/${lib}-${{ matrix.name }}.${{ matrix.ext }}"
+          done
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: attach binaries to the release
+    needs: [ build-linux, build-native ]
+    if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.release_tag }}
+        run: |
+          echo "Attaching binaries to release: $TAG"
+          gh release upload "$TAG" dist/* --repo "${GITHUB_REPOSITORY}" --clobber

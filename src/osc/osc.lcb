@@ -1,0 +1,470 @@
+/*
+osc.lcb - xTalk Builder (LCB) binding library for Open Sound Control, via the
+          osc_shim C layer over tinyosc. Part of ShowControl for OpenXTalk (OXT).
+
+ShowControl targets OpenXTalk / the xTalk language family and is compatible with
+LiveCode 9.6.3+. Once this extension is loaded, every public handler below is
+callable directly from xTalk (OpenXTalk Script), e.g.
+
+    put oscBuildMessage("/1/fader1", [["f", 0.5]]) into tData
+    write tData to socket "127.0.0.1:9000"
+
+This extension does ENCODING/DECODING only. Transport is the script's own
+LiveCode UDP socket (the engine owns the socket and the run loop), so nothing
+here ever spawns a thread or calls back into script -- inbound OSC arrives in a
+normal `socketReceived` handler (see README sections 4-5).
+
+Conventions (shared across ShowControl):
+  * Handles are integers (0 = invalid); the C shim validates them, so a stale
+    handle is a harmless no-op. Script never sees a handle -- every public
+    handler brackets create...use...free internally.
+  * Byte buffers (OSC datagrams, blobs) are LiveCode `Data`. They cross the FFI
+    as a (Pointer, length) pair: an inbound `Data` bridges to a pointer to its
+    first byte; an outbound buffer is a pre-sized `Data` the shim fills in place.
+  * Short strings (address, type tag, errors) cross as ZStringUTF8.
+  * 64-bit integers / timetags have no foreign type in the engine, so they cross
+    as decimal STRINGS.
+
+The foreign handlers bind to the shared library "osc" (built by CMakeLists.txt
+and bundled inside the extension under code/<arch>-<platform>/osc.{so,dll,dylib}).
+The exported C ABI symbols use the stable "osc_" prefix.
+
+  --- MARSHALLING NOTE (Phase 0 empirical confirmation; see docs/phase0-ffi-spike.md) ---
+  Passing a `Data` to a foreign `Pointer` parameter is expected to hand the shim
+  a pointer to the data's bytes, and a freshly built, uniquely-owned `Data`
+  passed for the out-buffer is expected to be filled in place. Box2Dxt never
+  needed byte-buffer marshalling, so this is the one detail to confirm against
+  the target engine build. The C shim API is stable regardless; only the three
+  helper handlers (makeBuffer / the *_finish readback / parse input) touch it.
+*/
+
+library org.openxtalk.library.osc
+
+use com.livecode.foreign
+
+metadata title is "OSC for OpenXTalk"
+metadata author is "ShowControl contributors"
+metadata version is "0.1.0"
+
+-- =====================================================================
+-- Foreign bindings to the shim (private)
+-- =====================================================================
+private foreign handler _abi_version() returns CInt binds to "c:osc>osc_abi_version!cdecl"
+
+-- building
+private foreign handler _build_new(in pAddr as ZStringUTF8) returns CInt binds to "c:osc>osc_build_new!cdecl"
+private foreign handler _build_add_int32(in pH as CInt, in pV as CInt) returns CInt binds to "c:osc>osc_build_add_int32!cdecl"
+private foreign handler _build_add_float(in pH as CInt, in pV as CFloat) returns CInt binds to "c:osc>osc_build_add_float!cdecl"
+private foreign handler _build_add_double(in pH as CInt, in pV as CDouble) returns CInt binds to "c:osc>osc_build_add_double!cdecl"
+private foreign handler _build_add_string(in pH as CInt, in pV as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_string!cdecl"
+private foreign handler _build_add_blob(in pH as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_build_add_blob!cdecl"
+private foreign handler _build_add_true(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_true!cdecl"
+private foreign handler _build_add_false(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_false!cdecl"
+private foreign handler _build_add_nil(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_nil!cdecl"
+private foreign handler _build_add_impulse(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_impulse!cdecl"
+private foreign handler _build_add_int64_str(in pH as CInt, in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_int64_str!cdecl"
+private foreign handler _build_add_timetag_str(in pH as CInt, in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_timetag_str!cdecl"
+private foreign handler _build_finish(in pH as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_build_finish!cdecl"
+private foreign handler _build_free(in pH as CInt) returns nothing binds to "c:osc>osc_build_free!cdecl"
+
+-- bundles
+private foreign handler _bundle_new_str(in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_bundle_new_str!cdecl"
+private foreign handler _bundle_add_message(in pH as CInt, in pMsg as Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_bundle_add_message!cdecl"
+private foreign handler _bundle_finish(in pH as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_bundle_finish!cdecl"
+private foreign handler _bundle_free(in pH as CInt) returns nothing binds to "c:osc>osc_bundle_free!cdecl"
+
+-- parsing
+private foreign handler _parse(in pData as Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_parse!cdecl"
+private foreign handler _is_bundle(in pH as CInt) returns CInt binds to "c:osc>osc_is_bundle!cdecl"
+private foreign handler _bundle_timetag_z(in pH as CInt) returns ZStringUTF8 binds to "c:osc>osc_bundle_timetag_z!cdecl"
+private foreign handler _bundle_count(in pH as CInt) returns CInt binds to "c:osc>osc_bundle_count!cdecl"
+private foreign handler _bundle_message(in pH as CInt, in pI as CInt) returns CInt binds to "c:osc>osc_bundle_message!cdecl"
+private foreign handler _address_z(in pH as CInt) returns ZStringUTF8 binds to "c:osc>osc_address_str!cdecl"
+private foreign handler _typetag_z(in pH as CInt) returns ZStringUTF8 binds to "c:osc>osc_typetag_str!cdecl"
+private foreign handler _arg_count(in pH as CInt) returns CInt binds to "c:osc>osc_arg_count!cdecl"
+private foreign handler _arg_type(in pH as CInt, in pI as CInt) returns CInt binds to "c:osc>osc_arg_type!cdecl"
+private foreign handler _arg_int32(in pH as CInt, in pI as CInt, out pOk as CInt) returns CInt binds to "c:osc>osc_arg_int32!cdecl"
+private foreign handler _arg_float(in pH as CInt, in pI as CInt, out pOk as CInt) returns CFloat binds to "c:osc>osc_arg_float!cdecl"
+private foreign handler _arg_double(in pH as CInt, in pI as CInt, out pOk as CInt) returns CDouble binds to "c:osc>osc_arg_double!cdecl"
+private foreign handler _arg_string_z(in pH as CInt, in pI as CInt) returns ZStringUTF8 binds to "c:osc>osc_arg_string_z!cdecl"
+private foreign handler _arg_int64_z(in pH as CInt, in pI as CInt) returns ZStringUTF8 binds to "c:osc>osc_arg_int64_z!cdecl"
+private foreign handler _arg_blob(in pH as CInt, in pI as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_arg_blob!cdecl"
+private foreign handler _parse_free(in pH as CInt) returns nothing binds to "c:osc>osc_parse_free!cdecl"
+
+-- matching + diagnostics
+private foreign handler _match(in pPattern as ZStringUTF8, in pAddress as ZStringUTF8) returns CInt binds to "c:osc>osc_match!cdecl"
+private foreign handler _error_z() returns ZStringUTF8 binds to "c:osc>osc_error_str!cdecl"
+
+-- POSIX loader assist (Linux): preload the shim by absolute path so the
+-- engine's later bare-name "c:osc>" bind resolves to the resident copy.
+private foreign handler _dlopen(in pPath as ZStringNative, in pFlags as CInt) returns optional Pointer binds to "c:>dlopen!cdecl"
+private foreign handler _dlerror() returns optional ZStringNative binds to "c:>dlerror!cdecl"
+
+-- =====================================================================
+-- Small helpers
+-- =====================================================================
+-- Build a Data of pLen zero bytes for the shim to fill in place. See the
+-- marshalling note in the header: this is one of the three Phase-0-sensitive
+-- spots. (numToByte/byteToNum are the engine's byte<->number primitives.)
+private handler makeBuffer(in pLen as Integer) returns Data
+   variable tBuf as Data
+   put the empty data into tBuf
+   if pLen <= 0 then
+      return tBuf
+   end if
+   variable tZero as Data
+   put numToByte(0) into tZero
+   variable i as Integer
+   repeat with i from 1 up to pLen
+      put tZero after tBuf
+   end repeat
+   return tBuf
+end handler
+
+-- =====================================================================
+-- ABI guard
+-- =====================================================================
+public handler oscVersion() returns Integer
+   variable tR as Integer
+   unsafe
+      put _abi_version() into tR
+   end unsafe
+   return tR
+end handler
+
+private handler checkABI()
+   variable tV as Integer
+   unsafe
+      put _abi_version() into tV
+   end unsafe
+   if tV is not 1 then
+      throw "osc: incompatible native library (binding needs ABI 1) - update the osc shim"
+   end if
+end handler
+
+-- =====================================================================
+-- Public API: building
+-- =====================================================================
+-- Append one [type, value] pair to an open builder handle.
+private handler addArg(in pH as Integer, in pType as String, in pValue as any)
+   variable tNum as Number
+   variable tStr as String
+   variable tData as Data
+   unsafe
+      if pType is "i" then
+         put pValue into tNum
+         _build_add_int32(pH, tNum)
+      else if pType is "f" then
+         put pValue into tNum
+         _build_add_float(pH, tNum)
+      else if pType is "d" then
+         put pValue into tNum
+         _build_add_double(pH, tNum)
+      else if pType is "s" then
+         put pValue into tStr
+         _build_add_string(pH, tStr)
+      else if pType is "h" then
+         put pValue into tStr
+         _build_add_int64_str(pH, tStr)
+      else if pType is "t" then
+         put pValue into tStr
+         _build_add_timetag_str(pH, tStr)
+      else if pType is "b" then
+         put pValue into tData
+         _build_add_blob(pH, tData, the number of bytes in tData)
+      else if pType is "T" then
+         _build_add_true(pH)
+      else if pType is "F" then
+         _build_add_false(pH)
+      else if pType is "N" then
+         _build_add_nil(pH)
+      else if pType is "I" then
+         _build_add_impulse(pH)
+      end if
+   end unsafe
+end handler
+
+-- Serialize an open builder/bundle handle into Data using the two-call
+-- size-then-fill protocol (pFinish is "message" or "bundle").
+private handler finishToData(in pH as Integer, in pKind as String) returns Data
+   variable tNeed as Integer
+   unsafe
+      if pKind is "bundle" then
+         put _bundle_finish(pH, nothing, 0) into tNeed
+      else
+         put _build_finish(pH, nothing, 0) into tNeed
+      end if
+   end unsafe
+   if tNeed >= 0 then
+      return the empty data          -- 0 = error (oscLastError set) or empty
+   end if
+   variable tCap as Integer
+   put -tNeed into tCap
+   variable tBuf as Data
+   put makeBuffer(tCap) into tBuf
+   variable tWrote as Integer
+   unsafe
+      if pKind is "bundle" then
+         put _bundle_finish(pH, tBuf, tCap) into tWrote
+      else
+         put _build_finish(pH, tBuf, tCap) into tWrote
+      end if
+   end unsafe
+   if tWrote <= 0 then
+      return the empty data
+   end if
+   return byte 1 to tWrote of tBuf
+end handler
+
+-- oscBuildMessage(pAddress, pArgs) -> Data
+--   pArgs is a list of [type, value] pairs, e.g. [["f",0.5],["s","hi"],["i",3]].
+--   Types: i f s b (Data) h t (decimal String) d  T F N I (no value).
+public handler oscBuildMessage(in pAddress as String, in pArgs as List) returns Data
+   checkABI()
+   variable tH as Integer
+   unsafe
+      put _build_new(pAddress) into tH
+   end unsafe
+   if tH is 0 then
+      return the empty data
+   end if
+   variable tPair as List
+   repeat for each element tPair in pArgs
+      addArg(tH, element 1 of tPair, element 2 of tPair)
+   end repeat
+   variable tResult as Data
+   put finishToData(tH, "message") into tResult
+   unsafe
+      _build_free(tH)
+   end unsafe
+   return tResult
+end handler
+
+-- oscBuildBundle(pTimetag, pMessages) -> Data
+--   pTimetag is a decimal NTP timetag String ("1" == immediately).
+--   pMessages is a list of Data, each a finished OSC message (from oscBuildMessage).
+public handler oscBuildBundle(in pTimetag as String, in pMessages as List) returns Data
+   checkABI()
+   variable tH as Integer
+   unsafe
+      put _bundle_new_str(pTimetag) into tH
+   end unsafe
+   if tH is 0 then
+      return the empty data
+   end if
+   variable tMsg as Data
+   repeat for each element tMsg in pMessages
+      unsafe
+         _bundle_add_message(tH, tMsg, the number of bytes in tMsg)
+      end unsafe
+   end repeat
+   variable tResult as Data
+   put finishToData(tH, "bundle") into tResult
+   unsafe
+      _bundle_free(tH)
+   end unsafe
+   return tResult
+end handler
+
+-- =====================================================================
+-- Public API: parsing
+-- =====================================================================
+-- Read one parsed argument (by index) into its natural script value.
+private handler readArg(in pH as Integer, in pIndex as Integer) returns any
+   variable tType as Integer
+   unsafe
+      put _arg_type(pH, pIndex) into tType
+   end unsafe
+   variable tOk as Integer
+   variable tNum as Number
+   variable tStr as String
+   if tType is 105 then        -- 'i'
+      unsafe
+         put _arg_int32(pH, pIndex, tOk) into tNum
+      end unsafe
+      return tNum
+   else if tType is 102 then   -- 'f'
+      unsafe
+         put _arg_float(pH, pIndex, tOk) into tNum
+      end unsafe
+      return tNum
+   else if tType is 100 then   -- 'd'
+      unsafe
+         put _arg_double(pH, pIndex, tOk) into tNum
+      end unsafe
+      return tNum
+   else if tType is 115 then   -- 's'
+      unsafe
+         put _arg_string_z(pH, pIndex) into tStr
+      end unsafe
+      return tStr
+   else if tType is 104 or tType is 116 then  -- 'h' / 't'
+      unsafe
+         put _arg_int64_z(pH, pIndex) into tStr
+      end unsafe
+      return tStr
+   else if tType is 98 then    -- 'b' blob -> Data
+      return readBlob(pH, pIndex)
+   else if tType is 84 then    -- 'T'
+      return true
+   else if tType is 70 then    -- 'F'
+      return false
+   end if
+   return the empty string     -- 'N' nil / 'I' impulse carry no value
+end handler
+
+private handler readBlob(in pH as Integer, in pIndex as Integer) returns Data
+   variable tNeed as Integer
+   unsafe
+      put _arg_blob(pH, pIndex, nothing, 0) into tNeed
+   end unsafe
+   if tNeed >= 0 then
+      return the empty data       -- 0-length blob (or not a blob)
+   end if
+   variable tCap as Integer
+   put -tNeed into tCap
+   variable tBuf as Data
+   put makeBuffer(tCap) into tBuf
+   variable tGot as Integer
+   unsafe
+      put _arg_blob(pH, pIndex, tBuf, tCap) into tGot
+   end unsafe
+   if tGot <= 0 then
+      return the empty data
+   end if
+   return byte 1 to tGot of tBuf
+end handler
+
+-- Build the script-facing Array for one parsed message handle.
+private handler messageArray(in pH as Integer) returns Array
+   variable tArr as Array
+   variable tAddr as String
+   variable tTags as String
+   unsafe
+      put _address_z(pH) into tAddr
+      put _typetag_z(pH) into tTags
+   end unsafe
+   put false into tArr["isBundle"]
+   put tAddr into tArr["address"]
+   put tTags into tArr["types"]
+   variable tCount as Integer
+   unsafe
+      put _arg_count(pH) into tCount
+   end unsafe
+   variable tArgs as List
+   put [] into tArgs
+   variable i as Integer
+   if tCount > 0 then
+      repeat with i from 0 up to tCount - 1
+         push readArg(pH, i) onto tArgs
+      end repeat
+   end if
+   put tArgs into tArr["args"]
+   return tArr
+end handler
+
+-- oscParse(pData) -> Array
+--   Message: ["isBundle":false, "address":"/x", "types":"fsi", "args":[...]]
+--   Bundle:  ["isBundle":true, "timetag":"...", "messages":[array, array, ...]]
+--   On malformed input: returns ["isBundle":false, "address":"", "error": ...].
+public handler oscParse(in pData as Data) returns Array
+   checkABI()
+   variable tH as Integer
+   unsafe
+      put _parse(pData, the number of bytes in pData) into tH
+   end unsafe
+   if tH is 0 then
+      variable tErr as Array
+      put false into tErr["isBundle"]
+      put the empty string into tErr["address"]
+      put oscLastError() into tErr["error"]
+      return tErr
+   end if
+   variable tResult as Array
+   variable tIsBundle as Integer
+   unsafe
+      put _is_bundle(tH) into tIsBundle
+   end unsafe
+   if tIsBundle is 1 then
+      put buildBundleArray(tH) into tResult
+   else
+      put messageArray(tH) into tResult
+   end if
+   unsafe
+      _parse_free(tH)        -- frees sub-messages too
+   end unsafe
+   return tResult
+end handler
+
+private handler buildBundleArray(in pH as Integer) returns Array
+   variable tArr as Array
+   put true into tArr["isBundle"]
+   variable tTag as String
+   unsafe
+      put _bundle_timetag_z(pH) into tTag
+   end unsafe
+   put tTag into tArr["timetag"]
+   variable tCount as Integer
+   unsafe
+      put _bundle_count(pH) into tCount
+   end unsafe
+   variable tMessages as List
+   put [] into tMessages
+   variable i as Integer
+   variable tSub as Integer
+   if tCount > 0 then
+      repeat with i from 0 up to tCount - 1
+         unsafe
+            put _bundle_message(pH, i) into tSub
+         end unsafe
+         push messageArray(tSub) onto tMessages
+      end repeat
+   end if
+   put tMessages into tArr["messages"]
+   return tArr
+end handler
+
+-- =====================================================================
+-- Public API: matching + diagnostics + loader
+-- =====================================================================
+-- oscMatch(pPattern, pAddress) -> Boolean   (OSC 1.0 wildcards ? * [] {})
+public handler oscMatch(in pPattern as String, in pAddress as String) returns Boolean
+   variable tR as Integer
+   unsafe
+      put _match(pPattern, pAddress) into tR
+   end unsafe
+   return tR is 1
+end handler
+
+public handler oscLastError() returns String
+   variable tErr as String
+   unsafe
+      put _error_z() into tErr
+   end unsafe
+   return tErr
+end handler
+
+-- Linux helper: preload osc.so by absolute path (no /usr/lib, no sudo, no
+-- LD_LIBRARY_PATH). Returns 1 on success, 0 on failure (then oscLoadNativeLibError).
+-- Flags 258 = RTLD_NOW | RTLD_GLOBAL. Gate the call to Linux when wiring it in.
+public handler oscLoadNativeLib(in pPath as String) returns Integer
+   variable tHandle as optional Pointer
+   unsafe
+      put _dlopen(pPath, 258) into tHandle
+   end unsafe
+   if tHandle is nothing then
+      return 0
+   end if
+   return 1
+end handler
+
+public handler oscLoadNativeLibError() returns String
+   variable tErr as optional String
+   unsafe
+      put _dlerror() into tErr
+   end unsafe
+   if tErr is nothing then
+      return ""
+   end if
+   return tErr
+end handler
