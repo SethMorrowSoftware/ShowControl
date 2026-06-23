@@ -52,6 +52,12 @@ if(SHOWCONTROL_BUILD_OSC)
         OUTPUT_NAME "osc"
         PREFIX "")                     # emit osc.so/.dylib (bare token, matches c:osc>)
 
+    # tinyosc uses ntohl/htonl/ntohll/htonll; on Windows those live in winsock2 /
+    # ws2_32, so the link fails without it. (No-op on Linux/macOS.)
+    if(WIN32)
+        target_link_libraries(osc PRIVATE ws2_32)
+    endif()
+
     # Keep our shim warning-clean; tinyosc's own (vendored) warnings are not fatal
     # (no -Werror), exactly as Box2Dxt treats Box2D.
     if(MSVC)
