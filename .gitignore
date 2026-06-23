@@ -1,0 +1,20 @@
+# CMake out-of-source build directories (see docs/building.md)
+/build/
+/build-asan/
+/build-*/
+
+# Python bytecode (from tools/ and tests/)
+__pycache__/
+*.pyc
+
+# Generated distribution archives; the committed code/<platform-id>/ binaries
+# and dist/INSTALL.md are tracked, the built zips are not.
+/dist/*.zip
+/dist/*.lce
+
+# Local scratch / editor noise
+*.swp
+.DS_Store
+
+# Stray object files
+*.o
