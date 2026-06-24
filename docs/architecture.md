@@ -305,9 +305,11 @@ parsed packets.
 
 ## The ABI version
 
-Each shim exports an ABI version, currently **`1`** for both:
+Each shim exports an ABI version - **osc is `2`**, **midi is `1`**:
 
-- `osc_abi_version()` - `OSC_ABI_VERSION` in [`osc_shim.h`](../src/osc/osc_shim.h).
+- `osc_abi_version()` - `OSC_ABI_VERSION` in [`osc_shim.h`](../src/osc/osc_shim.h)
+  (bumped to `2`: the numeric build args now cross as decimal strings via
+  `osc_build_add_int32_str` / `_float_str` / `_double_str`).
 - `midi_abi_version()` - `MIDI_ABI_VERSION` in [`midi_shim.h`](../src/midi/midi_shim.h).
 
 Use it as a load/version sanity check (the LCB layer surfaces it, and the smoke

@@ -24,11 +24,28 @@ static void check(const char *name, int ok) {
 
 int main(void) {
     printf("osc ABI version = %d\n", osc_abi_version());
-    check("ABI version is 1", osc_abi_version() == 1);
+    check("ABI version is 2", osc_abi_version() == 2);
 
     uint8_t buf[1024];
     char sbuf[256];
     int32_t ok;
+
+    /* ---- numeric build args via decimal STRINGS (ABI 2 path the .lcb uses) ----
+       The xTalk engine hands script numbers to a foreign `any` as strings; the
+       binding stringifies every numeric value and these parse it in C. */
+    { int32_t sh = osc_build_new("/numstr");
+      osc_build_add_int32_str (sh, "-42");
+      osc_build_add_float_str (sh, "0.5");      /* the value that broke any->Number */
+      osc_build_add_double_str(sh, "3.25");
+      int32_t sn = osc_build_finish(sh, buf, sizeof buf);
+      osc_build_free(sh);
+      int32_t sm = osc_parse(buf, sn);
+      osc_typetag(sm, sbuf, sizeof sbuf);
+      check("str-built typetag is ifd", strcmp(sbuf, "ifd") == 0);
+      check("int32_str -42",  osc_arg_int32 (sm, 0, &ok) == -42 && ok);
+      check("float_str 0.5",  fabsf(osc_arg_float (sm, 1, &ok) - 0.5f) < 1e-6 && ok);
+      check("double_str 3.25", fabs(osc_arg_double(sm, 2, &ok) - 3.25) < 1e-12 && ok);
+      osc_parse_free(sm); }
 
     /* ---- build a message with one of every common type ---- */
     int32_t b = osc_build_new("/test/all");

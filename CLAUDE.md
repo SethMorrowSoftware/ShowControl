@@ -103,7 +103,7 @@ deliberate future item, behind the same script API.
   char*` into memory with an **explicit, documented lifetime** (a parsed-model field valid until
   `*_free`, or a module static the engine copies immediately - the proven Box2Dxt
   `dlerror`/`realpath` pattern). The `_str`/`_z` accessors are case (b).
-- **Bump the per-shim `*_ABI_VERSION`** (currently `1` for both) on any ABI change; the `.lcb`
+- **Bump the per-shim `*_ABI_VERSION`** (osc is `2`, midi is `1`) on any ABI change; the `.lcb`
   `checkABI()` throws a clear error on skew instead of crashing on first use.
 - **Adding a handler:** `<prefix>_*` in the shim (validate inputs) -> `private foreign handler` +
   public wrapper in the `.lcb` -> bump ABI if the ABI changed -> add a smoke-test assertion ->
