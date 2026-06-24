@@ -241,11 +241,21 @@ jobs:
           fi
           git commit -m "CI: refresh committed native binaries from ${GITHUB_SHA::7} [skip ci]"
           git push -f origin "$branch"
-          open_count=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq 'length')
-          if [ "$open_count" -gt 0 ]; then
+          echo "Binaries built, placed, and pushed to branch '$branch'."
+          # Opening/updating the PR is BEST-EFFORT. If the repo hasn't enabled
+          # "Allow GitHub Actions to create and approve pull requests", gh fails
+          # here -- but the binaries are already safely on the branch, so the job's
+          # real work succeeded. Surface a clear, actionable warning instead of
+          # failing the whole job (which reads as "nothing got built").
+          pr_body="Automated refresh of src/<ext>/code/<platform-id>/ from the latest build of osc_shim.c / midi_shim.c (source commit ${GITHUB_SHA::7}), built and tested by the build workflow. Merge to update the committed, ready-to-package binaries. 32-bit Linux (x86-linux) is not built by CI yet, so that slot is unchanged."
+          open_count=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq 'length' 2>/dev/null || echo 0)
+          if [ "${open_count:-0}" -gt 0 ]; then
             echo "Existing open PR was updated by the force-push."
+          elif gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+                 --title "CI: refresh committed native binaries" --body "$pr_body"; then
+            echo "Opened the refresh PR."
           else
-            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
-              --title "CI: refresh committed native binaries" \
-              --body "Automated refresh of \`src/<ext>/code/<platform-id>/\` from the latest build of \`osc_shim.c\` / \`midi_shim.c\` (source commit ${GITHUB_SHA::7}), built and tested by the \`build\` workflow. Merge to update the committed, ready-to-package binaries. 32-bit Linux (\`x86-linux\`) is not built by CI yet, so that slot is unchanged."
+            note="Native binaries were built and pushed to branch '$branch', but the PR could not be opened automatically (usually: Settings -> Actions -> General -> 'Allow GitHub Actions to create and approve pull requests' is off). Enable it and re-run, or open the PR by hand: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${branch}?expand=1"
+            echo "::warning::${note}"
+            { echo "### Native binaries refreshed - PR not auto-opened"; echo; echo "${note}"; } >> "$GITHUB_STEP_SUMMARY"
           fi
