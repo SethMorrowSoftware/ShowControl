@@ -343,6 +343,17 @@ public handler midiPoll(in pHandle as Integer) returns List
    return tEvents
 end handler
 
+-- midiDecode(pBytes) -> Array
+--   Decode one raw MIDI message (Data) into the SAME semantic record midiPoll
+--   produces -- ["kind", "channel", "data1", "data2", "value14", "bytes", "delta"]
+--   -- with delta 0. Useful for decoding MIDI that arrives from somewhere other
+--   than a polled input (a file, a Web-MIDI bridge, a test harness), and it makes
+--   the decode logic verifiable with NO MIDI hardware at all (drive it with
+--   synthetic bytes and assert the result -- see examples/selftest.livecodescript).
+public handler midiDecode(in pBytes as Data) returns Array
+   return decodeEvent(pBytes, 0)
+end handler
+
 -- Decode a raw MIDI message + delta into a semantic record.
 private handler decodeEvent(in pBytes as Data, in pDeltaUs as Integer) returns Array
    variable tRec as Array
