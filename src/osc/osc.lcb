@@ -158,9 +158,12 @@ private handler addArg(in pH as Integer, in pType as String, in pValue as any) r
    variable tData as Data
    variable tOk as Boolean
    put true into tOk
-   -- Every numeric value crosses to C as a decimal STRING. `put pValue into tStr`
-   -- (any -> String) always succeeds, whereas `put pValue into <Number>` fails for
-   -- a decimal value the engine handed us as a string (e.g. 0.5). C parses it.
+   -- Every numeric value crosses to C as a decimal STRING, which C parses. The
+   -- caller MUST pass numeric/string values as Strings: LCB cannot introspect an
+   -- `any` or convert a Number -> String (no type test, no try/catch -- see the
+   -- LCB Language Reference), so `put pValue into tStr` only succeeds when pValue
+   -- already IS a String. The script helpers (scAddArg / stAddArg) guarantee this
+   -- by forcing every non-blob value through `& empty` before it enters the list.
    unsafe
       if pType is "i" then
          put pValue into tStr

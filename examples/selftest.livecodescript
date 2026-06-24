@@ -324,7 +324,14 @@ end stLooksLikePacket
 -- oscBuildMessage. (Self-contained copy of showcontrol-helpers' scAddArg.)
 private command stAddArg @pArgs, pType, pValue
    put pType into pArgs[(the number of elements of pArgs) + 1]
-   put pValue into pArgs[(the number of elements of pArgs) + 1]
+   if pType is "b" then
+      put pValue into pArgs[(the number of elements of pArgs) + 1]   -- raw Data
+   else
+      -- Force to a STRING: LCB's `any`-typed addArg parameter cannot convert a
+      -- Number to a String (no type test, no try/catch in LCB), so values the
+      -- engine kept as numbers must be stringified here. `& empty` does that.
+      put (pValue & empty) into pArgs[(the number of elements of pArgs) + 1]
+   end if
 end stAddArg
 
 private command stSection pTitle
