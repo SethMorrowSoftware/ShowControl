@@ -8,6 +8,28 @@ where they diverge; the project as a whole tracks the headline milestones below.
 The initial implementation scaffold: a verified native core, the three LCB
 bindings, the build/test/CI machinery, and the documentation set.
 
+### Hardware-free in-OXT test kit
+
+Ways to validate the whole stack inside OpenXTalk with no controllers, DAWs, or
+DMX nodes - by looping each extension's output back through its own input.
+- `midiDecode(pBytes)` - a new public MIDI handler that decodes one raw message
+  into the same record `midiPoll` produces. It makes the decode logic testable
+  with **no MIDI hardware** (drive it with synthetic bytes), and is useful on its
+  own for decoding MIDI from a file / Web-MIDI bridge / sniffer. Pure LCB, no C/ABI
+  change.
+- `examples/selftest.livecodescript` - an automated, three-tier pass/fail self-test
+  across all three extensions: Tier 1 pure `build -> parse` round-trips (every OSC
+  type, bundles, `oscMatch`, Art-Net golden bytes, the MIDI decoder), Tier 2 OSC +
+  Art-Net UDP loopback to `127.0.0.1`, Tier 3 MIDI enumeration / virtual-port
+  lifecycle / errors. Tier 1 also serves as the Phase-0 `Data <-> pointer` FFI
+  confirmation.
+- `examples/loopback-monitor.livecodescript` - an interactive, self-building visual
+  monitor: a "virtual DMX rig" of 16 fixtures that lights up from looped-back
+  Art-Net, plus an OSC echo. The "watch it work" companion to the self-test.
+- `docs/testing-in-oxt.md` - how to run both, the three tiers, and software MIDI
+  loopback (IAC / ALSA `aconnect` / loopMIDI) for a full hardware-free MIDI
+  round-trip. README, API reference, and doc index updated.
+
 ### Deep pre-OXT review (second hardening pass)
 
 A second full audit of all three extensions ahead of the first OXT runtime pass,

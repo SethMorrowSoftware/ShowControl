@@ -149,6 +149,7 @@ midiSend(h, pBytes)                                              -- raw Data, e.
 midiNoteOn / midiNoteOff / midiControlChange / midiProgramChange
 midiPitchBend / midiChannelPressure                             -- channels are 1-based
 midiPoll(h)                                    -> List of decoded event records
+midiDecode(pBytes)                             -> one decoded record (also handy for HW-free tests)
 midiLastError()                                -> String
 ```
 
@@ -288,6 +289,17 @@ across Linux / macOS-universal / Windows. The sanitizer gate uses
 only printing — including `float-cast-overflow`, which is **not** in the default
 `undefined` group but is reachable from a hostile OSC float argument.
 
+**Testing inside OXT — no hardware needed.** Loop each extension's output back
+through its own input to validate the whole stack with no controllers, DAWs, or DMX
+nodes. [`examples/selftest.livecodescript`](examples/selftest.livecodescript) is an
+automated pass/fail run across all three (build→parse round-trips, `oscMatch`,
+Art-Net golden bytes, the MIDI decoder, UDP loopback, port lifecycle);
+[`examples/loopback-monitor.livecodescript`](examples/loopback-monitor.livecodescript)
+is an interactive visual monitor whose "virtual DMX rig" lights up from looped-back
+Art-Net. Tier 1 of the self-test also doubles as the [Phase-0 FFI confirmation](docs/phase0-ffi-spike.md).
+Full how-to (including software MIDI loopback for a complete MIDI round-trip):
+[`docs/testing-in-oxt.md`](docs/testing-in-oxt.md).
+
 ## Design rules that keep this safe
 
 These are non-negotiable invariants; full list in
@@ -344,6 +356,7 @@ Details and notice-retention requirements: [`THIRD-PARTY-NOTICES.md`](THIRD-PART
 | [`docs/api-reference.md`](docs/api-reference.md) | Every public handler, the `oscParse` Array and `midiPoll` record shapes, failure behavior, units. |
 | [`docs/architecture.md`](docs/architecture.md) | The three layers, why the shims exist, the no-callback rule, sockets-vs-polling, FFI marshalling, the ABI. |
 | [`docs/building.md`](docs/building.md) | Build the native libraries, run the C tests, package each extension, the platform/CPU/signing matrix. |
+| [`docs/testing-in-oxt.md`](docs/testing-in-oxt.md) | Validate the whole stack inside OXT with **no hardware** — the automated self-test, the visual loopback monitor, and software MIDI loopback. |
 | [`docs/phase0-ffi-spike.md`](docs/phase0-ffi-spike.md) | The one empirical unknown for the OXT pass: `Data` ⇄ pointer marshalling, with a hex-transport fallback. |
 | [`docs/project-plan.md`](docs/project-plan.md) | The original strategy: target users, competitive positioning, showcase demos, milestones, risk register, roadmap. |
 | [`CLAUDE.md`](CLAUDE.md) | The as-built record and the hard-won-lesson list (FFI conventions, per-extension gotchas). |

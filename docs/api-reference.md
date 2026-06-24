@@ -289,6 +289,21 @@ this loop and `send`s a per-event message (`onNoteOn`, `onControlChange`, ...) s
 you can write only handlers - see
 [architecture.md](architecture.md#the-two-inbound-patterns).
 
+### `midiDecode(pBytes)` -> Array
+
+Decode **one** raw MIDI message (`Data`) into the same record shape `midiPoll`
+returns (`kind` / `channel` / `data1` / `data2` / `value14` / `bytes` / `delta`,
+with `delta` 0). Use it to decode MIDI bytes that arrive from somewhere other than a
+polled input - a file, a Web-MIDI bridge, a sniffer - and to **unit-test your MIDI
+handling with no hardware** (drive it with synthetic bytes and assert the result;
+the in-OXT self-test does exactly this - see
+[testing-in-oxt.md](testing-in-oxt.md)).
+
+```
+put midiDecode(numToByte(144) & numToByte(60) & numToByte(100)) into tEvent
+-- tEvent["kind"] is "noteOn", tEvent["channel"] is 1, tEvent["data1"] is 60
+```
+
 ### `midiLastError()` -> String
 
 Return the last MIDI error string (empty when the last fallible call succeeded).
