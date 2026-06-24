@@ -480,7 +480,9 @@ The Art-Net extension is **pure LCB** — there is nothing to compile, no shared
 
 ### 8.4 Bundling into the extension
 
-For OSC and MIDI, place the shared libs in each extension's private library folder and reference by name in `binds to` (`"c:midi_shim>midi_in_drain!cdecl"`). Ship per-arch/per-OS binaries; LCB binds lazily so a single module can carry all platforms' bindings and only the ones invoked on the running platform resolve. Art-Net carries no binaries.
+For OSC and MIDI, place the shared libs in each extension's private `code/<platform-id>/` folder and reference them in `binds to` by the **bare token name** (`"c:midi>midi_in_drain!cdecl"`, `"c:osc>..."`; the file is `midi.so`/`osc.so` etc., no `lib` prefix). Ship per-arch/per-OS binaries; LCB binds lazily so a single module can carry all platforms' bindings and only the ones invoked on the running platform resolve. Art-Net carries no binaries.
+
+> **As-built naming note.** The planning sections above (5.3, 6.2, 11) refer to the shims as `osc_shim` / `midi_shim` (e.g. `libosc_shim.dylib`, `c:midi_shim>...`). The **shipped** libraries use the bare tokens `osc` / `midi` (`osc.so` / `midi.so` / `.dll` / `.dylib`) and bind via `c:osc>` / `c:midi>`, so the bundled `code/<platform-id>/<token>` file resolves automatically through `revLibraryMapping`. `docs/building.md` and `CLAUDE.md` are the authoritative as-built reference.
 
 ### 8.5 Architectures & engine targets
 

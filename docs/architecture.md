@@ -35,7 +35,7 @@ locked C ABI.
   your xTalk script
         |  oscBuildMessage / midiPoll / artnetBuildDmx   (Data, Arrays, Lists)
   +-----v---------------------------------------+
-  | src/<ext>/<ext>.livecodescript              |   script helpers: optional
+  | examples/showcontrol-helpers.livecodescript |   script helpers: optional
   |   - the MIDI poll dispatcher                |   sugar + the poll loop
   +-----+---------------------------------------+
         |  public handlers: oscParse, midiOpenInput, artnetParseDmx, ...
@@ -87,8 +87,8 @@ automatically per platform with no loose file to place. Module names are
 reverse-DNS: `org.openxtalk.library.osc`, `org.openxtalk.library.midi`,
 `org.openxtalk.library.artnet`.
 
-**Top layer - script helpers (optional).** `src/<ext>/<ext>.livecodescript` is
-pure-xTalk sugar on top of the `.lcb` API. For MIDI it carries the **poll
+**Top layer - script helpers (optional).** `examples/showcontrol-helpers.livecodescript`
+is pure-xTalk sugar on top of the `.lcb` API. For MIDI it carries the **poll
 dispatcher** (the timer loop that calls `midiPoll` and `send`s a semantic message
 per event - see [The two inbound patterns](#the-two-inbound-patterns)); for OSC
 and Art-Net it is thin or absent, because their inbound path is the engine's own
@@ -194,8 +194,8 @@ pure codec; LiveCode owns the socket and the run loop.
 every inbound message in its internal FIFO. The LCB `midiPoll(pHandle)` makes one
 `midi_in_drain` call, walks the batched records, decodes each, and returns a list
 of event records. A script timer loop calls `midiPoll` and dispatches; ShowControl
-ships that loop as the **poll dispatcher** in `midi.livecodescript`, so users
-write only event handlers:
+ships that loop as the **poll dispatcher** in
+`examples/showcontrol-helpers.livecodescript`, so users write only event handlers:
 
 ```
    on midiPollAndDispatch pHandle
@@ -338,8 +338,8 @@ Exposing more of tinyosc / RtMidi is mechanical:
    table above, hides the handle, sets the module last-error on failure
    (so `oscLastError`/`midiLastError` report it), and returns empty/`0` rather
    than throwing across the boundary.
-3. **Script helper** (`src/<ext>/<ext>.livecodescript`, optional) - add sugar
-   only if it earns its place (e.g. a new dispatch case in the MIDI loop).
+3. **Script helper** (`examples/showcontrol-helpers.livecodescript`, optional) - add
+   sugar only if it earns its place (e.g. a new dispatch case in the MIDI loop).
 4. **Bump `OSC_ABI_VERSION` / `MIDI_ABI_VERSION`** in the shim if the exported ABI
    changed.
 5. **Rebuild** the native library ([building.md](building.md)), refresh the

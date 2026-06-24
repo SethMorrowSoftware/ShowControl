@@ -249,12 +249,14 @@ Each record is an Array:
 | `channel` | **1-based** channel 1-16 (for channel-voice messages) |
 | `data1` | first data byte - note number / controller / program (0-127) |
 | `data2` | second data byte - velocity / value (0-127; absent for 1-data messages) |
+| `value14` | reconstructed 14-bit value 0-16383 - **only** present for `kind = "pitchBend"` |
 
 `kind` is one of `"noteOn"`, `"noteOff"`, `"controlChange"`, `"programChange"`,
 `"pitchBend"`, `"channelPressure"`, `"polyAftertouch"`, or `"sysex"` (and
 `"other"` for anything not specially decoded). For `"pitchBend"` the 14-bit value
-is reconstructed; for `"sysex"` the full message is in `bytes`. `channel`/`data1`/
-`data2` are present only where the kind defines them - always branch on `kind`.
+is reconstructed into `value14` (0-16383, 8192 = centre); for `"sysex"` the full
+message is in `bytes`. `channel`/`data1`/`data2`/`value14` are present only where
+the kind defines them - always branch on `kind`.
 
 > **`delta` is in seconds.** The native shim carries each message's inter-onset
 > gap in microseconds; the LCB layer converts it to seconds for `delta`. Because
@@ -282,7 +284,7 @@ on midiPollLoop
 end midiPollLoop
 ```
 
-ShowControl also ships a **poll dispatcher** in `midi.livecodescript` that wraps
+ShowControl also ships a **poll dispatcher** in `examples/showcontrol-helpers.livecodescript` that wraps
 this loop and `send`s a per-event message (`onNoteOn`, `onControlChange`, ...) so
 you can write only handlers - see
 [architecture.md](architecture.md#the-two-inbound-patterns).
@@ -318,8 +320,9 @@ one byte per channel (channel 1 is the first byte). Returns a ready-to-send ArtD
 datagram. The packet's mixed endianness (OpCode little-endian; protocol-version
 and Length big-endian) is handled for you.
 
-**Fails** (returns empty, sets last-error) on a `pChannels` longer than 512 bytes
-or an out-of-range universe.
+**Fails** (returns empty, sets last-error) on an out-of-range universe (outside
+`0..32767`). Channel data longer than 512 bytes is truncated to 512; shorter than 2
+is zero-padded, and an odd length is padded up to even.
 
 ```
 put numToByte(255) into tCh -- channel 1 full
@@ -333,8 +336,11 @@ Parse a received ArtDmx packet (`Data`) into an Array:
 | Key | Value |
 |-----|-------|
 | `opcode` | `"ArtDmx"` |
-| `universe` | the 15-bit universe number |
+| `universe` | the 15-bit universe number (`net * 256 + subuni`) |
+| `net` | the Net field (high 7 bits of the port-address) |
+| `subuni` | the low byte of the port-address (`SubNet << 4 \| Universe`), **not** the 4-bit SubNet alone |
 | `sequence` | the sequence byte (1-255 for ordering; 0 = disabled) |
+| `physical` | the Physical input port (informational) |
 | `length` | DMX data length in bytes (2-512, even) |
 | `channels` | the channel bytes as `Data` (`length` bytes, one per channel) |
 
@@ -369,12 +375,13 @@ Parse an **ArtPollReply** (a node's response to ArtPoll) into an Array:
 |-----|-------|
 | `opcode` | `"ArtPollReply"` |
 | `ip` | the node's IP address string (e.g. `"2.0.0.10"`) |
+| `net` | the node's Net field |
+| `subuni` | the node's Sub-Net/Universe switch byte |
 | `shortName` | the node's short name |
 | `longName` | the node's long name |
-| `numPorts` | number of DMX ports the node reports |
-| `universes` | a list of the universe numbers the node serves |
 
-(Additional reported fields may be present.) **Fails** (returns empty, sets
+(Richer per-port discovery - port counts and per-port universes - is intentionally
+out of scope for this cut; see README S7.) **Fails** (returns empty, sets
 last-error) if the bytes are not a valid ArtPollReply.
 
 ```
@@ -389,11 +396,13 @@ end replyArrived
 
 ### `artnetSendDmx(pUniverse, pChannels, pHost)` (optional convenience)
 
-If provided, this wraps build-plus-write: it builds an ArtDmx packet for
-`pUniverse` from `pChannels` and writes it to `pHost:6454` in one call (handy when
-you don't want to manage the socket write yourself). Equivalent to
-`write artnetBuildDmx(pUniverse, pChannels) to socket (pHost & ":6454")`. **Fails**
-(no-op, sets last-error) under the same conditions as `artnetBuildDmx`.
+This convenience verb ships in `examples/showcontrol-helpers.livecodescript` (not
+the extension itself - pure LCB cannot open sockets). It wraps build-plus-write:
+it builds an ArtDmx packet for `pUniverse` from `pChannels` and writes it to
+`pHost:6454`. Equivalent to
+`write artnetBuildDmx(pUniverse, pChannels) to socket (pHost & ":6454")`. Its
+failure behaviour is whatever the engine's `write` does - it does not itself set
+the Art-Net last-error (`artnetBuildDmx` returns empty on a bad universe as above).
 
 ```
 artnetSendDmx 0, tChannels, "2.0.0.10"

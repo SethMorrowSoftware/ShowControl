@@ -154,18 +154,19 @@ OXT Lite) - **no library download, no renaming, no sudo, no `/usr/lib`, no
 ## Refreshing the committed binaries
 
 `tools/package-extension.py` refreshes the committed `code/` trees when you have a
-newer build - point each flag at the matching library, and name the extension:
+newer build - point each flag at the matching built library:
 
 ```sh
-python3 tools/package-extension.py --check # list/validate the committed trees
-python3 tools/package-extension.py --ext osc --linux64 build/osc.so # refresh one osc target
-python3 tools/package-extension.py --ext midi --linux64 build/midi.so # refresh one midi target
+python3 tools/package-extension.py --check                       # list/validate the committed trees
+python3 tools/package-extension.py --osc-linux64 build/osc.so    # refresh one osc target
+python3 tools/package-extension.py --midi-linux64 build/midi.so  # refresh one midi target
 ```
 
-Use `--linux64` / `--linux32` / `--win64` / `--win32` / `--mac` for the platform
-you built, matching the platform-id table above. `--check` lists and validates the
-committed trees without writing anything (CI runs it as a guard). There is no
-`artnet` target - it has no binary.
+Each flag pairs an extension with a platform: `--osc-linux64` / `--osc-linux32` /
+`--osc-win64` / `--osc-win32` / `--osc-mac` and the `--midi-*` equivalents,
+matching the platform-id table above. `--check` lists and validates the committed
+trees without writing anything (it exits non-zero if any slot is empty). There is
+no `artnet` target - it has no binary.
 
 ## Packaging each extension into a .lce
 
@@ -242,12 +243,21 @@ is covered by byte-exact golden-packet fixtures and validated against Wireshark
 on native **Linux**, **macOS** (universal arm64 + x86_64), and **Windows** runners
 on every push and pull request, enabling `-DSHOWCONTROL_BUILD_TESTS=ON` so `ctest`
 runs the OSC and MIDI smoke tests on each (the MIDI test passes headless by
-design). On a `vX.Y.Z` tag it gathers every platform's `osc` and `midi` library
-and attaches them to a GitHub [Release](../../releases) - the canonical source of
-tested binaries for each version. `package-extension.py --check` runs as a guard
-that the committed `code/` trees match. **artnet**, being pure LCB, needs no build
-matrix and produces identical results everywhere; it is validated by its
-golden-packet tests rather than the native CI.
+design). A separate gate also builds the C smoke tests under AddressSanitizer +
+UndefinedBehaviorSanitizer with `-fno-sanitize-recover=all`, so any memory or UB
+error fails the build rather than only printing.
+
+When a GitHub [Release](../../releases) is **published** (or via a manual
+`workflow_dispatch` with a `release_tag`), CI gathers each platform's `osc` and
+`midi` library and attaches them to that release - the canonical source of tested
+binaries for each version. Note: pushing a bare `vX.Y.Z` tag does **not** trigger
+a build; publish a Release (or run the dispatch). Run `package-extension.py --check`
+locally to validate the committed `code/` trees before tagging. The matrix
+currently covers `x86_64-linux`, `universal-mac`, `x86_64-win32`, and `x86-win32`;
+**32-bit Linux (`x86-linux`) is not yet built** (tracked in CHANGELOG) - that slot
+stays empty until a job is added. **artnet**, being pure LCB, needs no build matrix
+and produces identical results everywhere; it is validated by its golden-packet
+tests rather than the native CI.
 
 See [architecture.md](architecture.md) for how the layers fit together and
 [getting-started.md](getting-started.md) to install and use the extensions.

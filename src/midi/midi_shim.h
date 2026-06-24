@@ -65,8 +65,11 @@ MIDI_API void     midi_close(int32_t handle);
 MIDI_API void     midi_in_ignore(int32_t handle, int32_t sysex, int32_t timing, int32_t sense);
 /* Drain up to max_msgs queued messages into `out` (see record format above).
  * Returns the number of records written. A message that does not fit is stashed
- * and emitted on the next call, so messages are never dropped. Returns 0 when
- * the queue is empty (and 0 on a bad/non-input handle). */
+ * and emitted on the next call, so messages are never dropped -- EXCEPT one that
+ * is structurally larger than out_cap itself (cannot happen with the LCB binding,
+ * whose buffer is sized to the maximum record), which is dropped with a last-error
+ * set rather than wedging the port forever. Returns 0 when the queue is empty (and
+ * 0 on a bad/non-input handle). */
 MIDI_API int32_t  midi_in_drain(int32_t handle, uint8_t *out, int32_t out_cap, int32_t max_msgs);
 
 /* ---- Output -------------------------------------------------------------- */

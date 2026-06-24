@@ -205,8 +205,8 @@ buffers between polls, a slow or jittery tick never drops a message - only
 worst-case latency scales with the 3 ms interval, so that number is your latency
 knob.
 
-> ShowControl ships a ready-made **poll dispatcher** in `midi.livecodescript`
-> that wraps this loop and `send`s a semantic message per event, so you can write
+> ShowControl ships a ready-made **poll dispatcher** in
+> `examples/showcontrol-helpers.livecodescript` that wraps this loop and `send`s a semantic message per event, so you can write
 > only event handlers. The loop above is the same idea inlined, shown so you can
 > see exactly what it does.
 

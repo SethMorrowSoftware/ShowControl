@@ -418,18 +418,29 @@ typedef struct parsed_msg {
 DEFINE_PTR_TABLE(parsed, parsed_msg)
 
 /* Forward decls */
+/* Cap bundle nesting. Each level recurses parse_depth->parse_bundle_bytes->
+ * parse_depth (and parsed_destroy frees recursively), so an unbounded nest is a
+ * stack-overflow DoS from a single datagram. 64 is far beyond any real bundle. */
+#define OSC_MAX_BUNDLE_DEPTH 64
+static int32_t parse_depth(const uint8_t *data, int32_t len, int depth);
 static int32_t parse_message_bytes(const uint8_t *data, int32_t len);
-static int32_t parse_bundle_bytes(const uint8_t *data, int32_t len);
+static int32_t parse_bundle_bytes(const uint8_t *data, int32_t len, int depth);
 static void parsed_destroy(int32_t h);
 
-OSC_API int32_t osc_parse(const uint8_t *data, int32_t len) {
-    err_clear();
+/* Internal dispatch carrying the bundle-nesting depth. osc_parse is the public
+ * entry that resets the error state and starts the recursion at depth 0. */
+static int32_t parse_depth(const uint8_t *data, int32_t len, int depth) {
     if (!data || len < 4) { err_set("oscParse: datagram too short"); return 0; }
     if (len & 3) { err_set("oscParse: length not a multiple of 4"); return 0; }
     if (len >= 8 && memcmp(data, "#bundle", 7) == 0 && data[7] == '\0')
-        return parse_bundle_bytes(data, len);
+        return parse_bundle_bytes(data, len, depth);
     if (data[0] != '/') { err_set("oscParse: address must start with '/'"); return 0; }
     return parse_message_bytes(data, len);
+}
+
+OSC_API int32_t osc_parse(const uint8_t *data, int32_t len) {
+    err_clear();
+    return parse_depth(data, len, 0);
 }
 
 /* ---------------------------------------------------------------------------
@@ -457,9 +468,9 @@ static int validate_message(const uint8_t *data, int32_t len,
     for (int32_t k = 0; k < nt; k++) {
         switch (data[ts + k]) {
             case 'i': case 'f':
-                if (p + 4 > len) { goto trunc; } p += 4; break;
+                if (4 > len - p) { goto trunc; } p += 4; break;   /* len-p>=0; avoids p+4 overflow */
             case 'h': case 't': case 'd':
-                if (p + 8 > len) { goto trunc; } p += 8; break;
+                if (8 > len - p) { goto trunc; } p += 8; break;
             case 's': {
                 int32_t s = p;
                 while (p < len && data[p] != '\0') p++;
@@ -468,9 +479,12 @@ static int validate_message(const uint8_t *data, int32_t len,
                 if (p > len) goto trunc;
                 (void) s; break; }
             case 'b': {
-                if (p + 4 > len) goto trunc;
+                if (4 > len - p) goto trunc;
                 int32_t bl = (int32_t) be32_load(data + p);
-                if (bl < 0 || p + 4 + bl > len) goto trunc;
+                /* len-p-4 >= 0 (just checked 4 <= len-p), so this can't overflow;
+                 * the old `p + 4 + bl > len` overflows int32 for bl near INT32_MAX
+                 * and ACCEPTS the blob -> a 2GB OOB read on the 32-bit targets. */
+                if (bl < 0 || bl > len - p - 4) goto trunc;
                 p = pad4(p + 4 + bl);
                 if (p > len) goto trunc;
                 break; }
@@ -545,7 +559,8 @@ static int32_t parse_message_bytes(const uint8_t *data, int32_t len) {
 }
 
 /* Validate + index a bundle, recursing into its elements. */
-static int32_t parse_bundle_bytes(const uint8_t *data, int32_t len) {
+static int32_t parse_bundle_bytes(const uint8_t *data, int32_t len, int depth) {
+    if (depth >= OSC_MAX_BUNDLE_DEPTH) { err_set("oscParse: bundle nesting too deep"); return 0; }
     if (len < 16) { err_set("oscParse: bundle too short"); return 0; }
     parsed_msg *m = (parsed_msg*) calloc(1, sizeof(parsed_msg));
     if (!m) { err_set("out of memory"); return 0; }
@@ -554,11 +569,14 @@ static int32_t parse_bundle_bytes(const uint8_t *data, int32_t len) {
 
     int32_t cap = 0;
     int32_t p = 16;
-    while (p + 4 <= len) {
+    while (p <= len - 4) {                            /* len>=16, so len-4>=12; p<=len holds */
         int32_t elen = (int32_t) be32_load(data + p);
         p += 4;
-        if (elen < 0 || p + elen > len) { err_set("oscParse: bad bundle element size"); goto bad; }
-        int32_t child = osc_parse(data + p, elen);   /* recurse (handles nesting) */
+        /* p <= len here, so len-p >= 0. The old `p + elen > len` overflows int32
+         * for an attacker-chosen huge elen and ACCEPTS the element -> heap OOB read
+         * in the recursive parse. Compare as elen > len-p to avoid the overflow. */
+        if (elen < 0 || elen > len - p) { err_set("oscParse: bad bundle element size"); goto bad; }
+        int32_t child = parse_depth(data + p, elen, depth + 1);   /* recurse, depth-capped */
         if (!child) goto bad;                          /* err already set */
         if (m->child_count >= cap) {
             int32_t nc = cap ? cap * 2 : 4;
@@ -673,8 +691,11 @@ OSC_API int32_t osc_arg_int64_str(int32_t h, int32_t i, char *out, int32_t out_c
     parsed_arg *a = arg_at(h, i);
     if (!a || (a->type != 'h' && a->type != 'i' && a->type != 't')) return -1;
     char tmp[24];
-    int n = snprintf(tmp, sizeof tmp, "%" PRId64, a->i);
-    (void) n;
+    /* A timetag ('t') is UNSIGNED NTP-64; int64 ('h') / int32 ('i') are signed.
+     * Every NTP timetag since ~1968 has the top bit set, so formatting a "now"
+     * value as signed would read back as a large negative number. */
+    if (a->type == 't') snprintf(tmp, sizeof tmp, "%" PRIu64, (uint64_t) a->i);
+    else                snprintf(tmp, sizeof tmp, "%" PRId64, a->i);
     return copy_str(tmp, out, out_cap);
 }
 OSC_API int32_t osc_bundle_timetag_str(int32_t h, char *out, int32_t out_cap) {
@@ -702,6 +723,12 @@ OSC_API void osc_parse_free(int32_t h) { parsed_destroy(h); }
 /* OSC 1.0 address pattern matching: ? * [ ] [!] [a-z] { , }              */
 /* Reference grammar from the OSC 1.0 spec, recursive matcher.            */
 /* ===================================================================== */
+/* ReDoS guard: the recursive '*' matcher is exponential for patterns with several
+ * stars (a hostile address/pattern hangs the engine's run loop). Bound the total
+ * step count -- generous for any real OSC address, fatal to a pathological one.
+ * The engine is single-threaded (the project's no-callback rule), so a module
+ * global reset per osc_match call is safe. */
+static long g_match_steps = 0;
 static int match_here(const char *p, const char *s);
 
 /* match a [ ... ] character class at p (p points just after '[') against s[0] */
@@ -744,12 +771,14 @@ static int match_alt(const char *p, const char *s, const char **p_after) {
 }
 
 static int match_here(const char *p, const char *s) {
+    if (--g_match_steps < 0) return 0;        /* ReDoS guard (see g_match_steps) */
     while (*p) {
         if (*p == '?') {
             if (*s == '\0' || *s == '/') return 0;
             p++; s++;
         } else if (*p == '*') {
             p++;
+            while (*p == '*') p++;            /* collapse a run of '*' (a**b == a*b) */
             if (*p == '\0') {                 /* trailing star: match to end of segment */
                 while (*s && *s != '/') s++;
                 return *s == '\0';
@@ -777,6 +806,7 @@ static int match_here(const char *p, const char *s) {
 
 OSC_API int32_t osc_match(const char *pattern, const char *address) {
     if (!pattern || !address) return 0;
+    g_match_steps = 2000000;   /* see g_match_steps; real matches use a few hundred */
     return match_here(pattern, address) ? 1 : 0;
 }
 
@@ -800,7 +830,9 @@ OSC_API const char *osc_arg_int64_z(int32_t h, int32_t i) {
     static char z[24];
     parsed_arg *a = arg_at(h, i);
     if (!a || (a->type != 'h' && a->type != 'i' && a->type != 't')) return "";
-    snprintf(z, sizeof z, "%" PRId64, a->i);
+    /* timetag ('t') is unsigned -- see osc_arg_int64_str */
+    if (a->type == 't') snprintf(z, sizeof z, "%" PRIu64, (uint64_t) a->i);
+    else                snprintf(z, sizeof z, "%" PRId64, a->i);
     return z;
 }
 OSC_API const char *osc_bundle_timetag_z(int32_t h) {

@@ -146,10 +146,12 @@ end handler
 -- Public API: building
 -- =====================================================================
 -- Append one [type, value] pair to an open builder handle.
-private handler addArg(in pH as Integer, in pType as String, in pValue as any)
+private handler addArg(in pH as Integer, in pType as String, in pValue as any) returns Boolean
    variable tNum as Number
    variable tStr as String
    variable tData as Data
+   variable tOk as Boolean
+   put true into tOk
    unsafe
       if pType is "i" then
          put pValue into tNum
@@ -180,8 +182,11 @@ private handler addArg(in pH as Integer, in pType as String, in pValue as any)
          _build_add_nil(pH)
       else if pType is "I" then
          _build_add_impulse(pH)
+      else
+         put false into tOk           -- unrecognized type code -> fail the build
       end if
    end unsafe
+   return tOk
 end handler
 
 -- Serialize an open builder/bundle handle into Data using the two-call
@@ -229,8 +234,15 @@ public handler oscBuildMessage(in pAddress as String, in pArgs as List) returns 
       return the empty data
    end if
    variable tPair as List
+   variable tArgOk as Boolean
    repeat for each element tPair in pArgs
-      addArg(tH, element 1 of tPair, element 2 of tPair)
+      put addArg(tH, element 1 of tPair, element 2 of tPair) into tArgOk
+      if not tArgOk then
+         unsafe
+            _build_free(tH)
+         end unsafe
+         return the empty data        -- unknown type code: fail quietly, build nothing
+      end if
    end repeat
    variable tResult as Data
    put finishToData(tH, "message") into tResult
