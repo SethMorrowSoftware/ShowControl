@@ -207,6 +207,35 @@ def check_lcb_structure(text):
     return errors
 
 
+def check_lcb_module(text):
+    """An LCB ``module``/``library``/``widget`` must be closed with a matching
+    ``end module``/``end library``/``end widget`` terminator. Without it the engine
+    parser runs to EOF and reports a bare ``syntax error`` at end-of-file -- the
+    exact failure the first OXT compile hit on all three bindings (the handler and
+    control gates above do not cover the module frame). Catch it here."""
+    # logical_lines() only strips '--' comments; blank out /* */ block comments
+    # (keeping newlines so line numbers stay accurate) so a word like "library"
+    # inside the header comment cannot false-match the declaration.
+    clean = re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
+    opener = None      # (kind, lineno) of the first module/library/widget line
+    closed = False
+    for lineno, code in logical_lines(clean):
+        toks = code.strip().lower().split()
+        if not toks:
+            continue
+        if opener is None and toks[0] in ("module", "library", "widget"):
+            opener = (toks[0], lineno)
+        elif toks[0] == "end" and len(toks) >= 2 and toks[1] in ("module", "library", "widget"):
+            if opener and toks[1] == opener[0]:
+                closed = True
+    if opener is None:
+        return ["  no 'module'/'library'/'widget' declaration found"]
+    if not closed:
+        kind, lineno = opener
+        return [f"  '{kind}' at L{lineno} is never closed (missing 'end {kind}' at end of file)"]
+    return []
+
+
 # ---------------------------------------------------------------------------
 # LiveCodeScript (.livecodescript) structure + dangling-else gates.
 # ---------------------------------------------------------------------------
@@ -309,6 +338,7 @@ def lint_file(path, kind):
     problems += check_smart_quotes(text)
     if kind == "lcb":
         problems += check_lcb_structure(text)
+        problems += check_lcb_module(text)
     else:
         problems += check_script_structure(text)
         problems += check_dangling_else(text)

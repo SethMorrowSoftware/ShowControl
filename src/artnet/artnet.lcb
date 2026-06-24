@@ -320,3 +320,5 @@ end handler
 public handler artnetLastError() returns String
    return sLastError
 end handler
+
+end library
