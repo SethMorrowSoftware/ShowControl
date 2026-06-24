@@ -61,33 +61,58 @@ the wire format; the extension is a pure codec over LiveCode's UDP sockets.
 ### `oscBuildMessage(pAddress, pArgs)` -> Data
 
 Build a single OSC message. `pAddress` is the OSC address pattern (a string such
-as `/1/fader1`); `pArgs` is a list of `[type, value]` pairs, e.g.
-`[["f", 0.5], ["s", "hello"], ["i", 3]]`. For the no-value types (`T`/`F`/`N`/`I`)
-the value is ignored (use `["T"]`). Returns the complete OSC datagram as `Data`,
-ready to `write ... to socket`.
+as `/1/fader1`); `pArgs` is a sequence of `[type, value]` pairs. For the no-value
+types (`T`/`F`/`N`/`I`) supply an (ignored) value, e.g. empty. Returns the complete
+OSC datagram as `Data`, ready to `write ... to socket`.
+
+> **Building `pArgs` in LiveCode Script.** xTalk has **no `[...]` list-literal
+> expression** (that is LiveCode *Builder* syntax) - you **cannot** write
+> `oscBuildMessage("/x", [["i", 60]])` in a `.livecodescript`. Build the args array
+> by assignment, or use the `scAddArg` helper in
+> `examples/showcontrol-helpers.livecodescript`:
+>
+> ```
+> local tArgs
+> scAddArg tArgs, "i", 60      -- each call appends one [type, value] pair
+> scAddArg tArgs, "f", 0.8
+> put oscBuildMessage("/synth/note", tArgs) into tData
+> ```
+>
+> `scAddArg` is just `put pType into tPair[1]; put pValue into tPair[2]; put tPair
+> into pArgs[(the number of elements of pArgs) + 1]`. (Inside a `.lcb`, the `[...]`
+> literal *is* valid - this caveat is only for the LiveCode Script side.)
 
 **Fails** (returns empty, sets last-error) on a null/over-long address, an unknown
 type code, or a value that cannot be coerced to the declared type.
 
 ```
-put oscBuildMessage("/synth/note", [["i", 60], ["f", 0.8]]) into tData
+local tArgs
+scAddArg tArgs, "i", 60
+scAddArg tArgs, "f", 0.8
+put oscBuildMessage("/synth/note", tArgs) into tData
 write tData to socket "127.0.0.1:7000"
 ```
 
 ### `oscBuildBundle(pTimetag, pMessages)` -> Data
 
 Build an OSC bundle. `pTimetag` is an NTP-64 timetag as a **decimal string**
-(`"1"` means "immediately"); `pMessages` is a list of `Data` values, each a
+(`"1"` means "immediately"); `pMessages` is a sequence of `Data` values, each a
 message previously built with `oscBuildMessage`. Returns the bundle datagram as
-`Data`.
+`Data`. (Build that sequence by assignment too - same no-`[...]` rule as above.)
 
 **Fails** (returns empty, sets last-error) on a bad timetag string or a non-`Data`
 element.
 
 ```
-put oscBuildMessage("/a", [["i", 1]]) into tA
-put oscBuildMessage("/b", [["f", 2.0]]) into tB
-write oscBuildBundle("1", [tA, tB]) to socket "127.0.0.1:7000"
+local tA, tB, tArgs, tMsgs
+scAddArg tArgs, "i", 1
+put oscBuildMessage("/a", tArgs) into tA
+put empty into tArgs
+scAddArg tArgs, "f", 2.0
+put oscBuildMessage("/b", tArgs) into tB
+put tA into tMsgs[1]
+put tB into tMsgs[2]
+write oscBuildBundle("1", tMsgs) to socket "127.0.0.1:7000"
 ```
 
 ### `oscParse(pData)` -> Array
@@ -136,7 +161,7 @@ end oscDataReceived
 
 on handleOneMessage tMsg
    if tMsg["address"] is "/1/fader1" then
-      set the thumbPosition of scrollbar "Vol" to (item 1 of tMsg["args"]) * 100
+      set the thumbPosition of scrollbar "Vol" to (tMsg["args"][1]) * 100
    end if
 end handleOneMessage
 ```
@@ -159,7 +184,9 @@ Return the last OSC error string (empty when the last fallible call succeeded).
 Call it right after a handler returns empty/`0` to learn why.
 
 ```
-put oscBuildMessage("/x", [["z", 1]]) into tData -- "z" is not a type code
+local tArgs
+scAddArg tArgs, "z", 1                            -- "z" is not a type code
+put oscBuildMessage("/x", tArgs) into tData
 if tData is empty then answer oscLastError()
 ```
 

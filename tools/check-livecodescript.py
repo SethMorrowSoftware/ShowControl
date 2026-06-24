@@ -358,6 +358,40 @@ def check_dangling_else(text):
     return errors
 
 
+def check_script_array_literals(text):
+    """LiveCode Script has NO ``[...]`` list-literal expression -- that is LiveCode
+    BUILDER syntax. In a .livecodescript, a ``[`` that is not an array SUBSCRIPT
+    (i.e. not immediately preceded, ignoring spaces, by an identifier char, ``)``
+    or ``]``) is an attempt to write an LCB-style list literal, e.g.
+    ``oscBuildMessage("/x", [["i", 60]])`` -- which does NOT compile in OXT. Build
+    the array by assignment instead (``put "i" into tPair[1]`` ...), or use the
+    scAddArg helper in showcontrol-helpers.livecodescript.
+
+    Subscripts (``tArray[1]``, ``tArray["k"]``, ``field 1[2]``) are preceded by an
+    identifier / ``)`` / ``]`` and are left alone. Strings and comments are
+    stripped first so a literal ``[`` inside a quoted string is ignored."""
+    ident = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_)]")
+    errors = []
+    for lineno, raw in enumerate(text.split("\n"), 1):
+        code = strip_comment(raw)
+        code = re.sub(r'"[^"]*"', '""', code)   # neutralise string-literal contents
+        for i, ch in enumerate(code):
+            if ch != "[":
+                continue
+            j = i - 1
+            while j >= 0 and code[j] in " \t":
+                j -= 1
+            prev = code[j] if j >= 0 else ""
+            if prev not in ident:
+                errors.append(
+                    f"  L{lineno}: '[...]' list literal is LiveCode Builder syntax -- LiveCode "
+                    "Script has no list-literal expression; build the array by assignment "
+                    "(or use scAddArg)"
+                )
+                break   # one report per line is enough
+    return errors
+
+
 # ---------------------------------------------------------------------------
 # Driver.
 # ---------------------------------------------------------------------------
@@ -375,6 +409,7 @@ def lint_file(path, kind):
     else:
         problems += check_script_structure(text)
         problems += check_dangling_else(text)
+        problems += check_script_array_literals(text)
     return problems
 
 
