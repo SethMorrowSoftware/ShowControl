@@ -8,6 +8,59 @@ where they diverge; the project as a whole tracks the headline milestones below.
 The initial implementation scaffold: a verified native core, the three LCB
 bindings, the build/test/CI machinery, and the documentation set.
 
+### Deep pre-OXT review (second hardening pass)
+
+A second full audit of all three extensions ahead of the first OXT runtime pass,
+with an independent adversarial review of the C shims (5M+ fuzzed datagrams, clean
+on the network path) and a hand-audit of the LCB byte arithmetic. Every C fix is
+verified under **ASan + UBSan + float-cast-overflow** (`-fno-sanitize-recover=all`).
+
+**OSC:**
+- **HIGH** Undefined behaviour coercing an out-of-range OSC `float`/`double` to
+  `int32` (C11 6.3.1.4 *float-cast-overflow*) - reachable from a hostile network
+  float, and **not** caught by the old gate (float-cast-overflow was split out of
+  `-fsanitize=undefined`). `osc_arg_int32` now saturates via a `d_to_i32` helper,
+  and the CI sanitizer gate adds `float-cast-overflow` so the whole class is gated.
+- **HIGH** `osc_bundle_add_message` with an element length near `INT32_MAX`
+  overflowed `4 + len`, skipped the buffer grow, and wrote through an unsized
+  buffer (a reproducible segfault). Now bounded with int64 math, and
+  `bundle_reserve` is overflow-safe. (Script-supplied length - not network-reachable.)
+- **LOW** `builder_size` now accumulates in int64 and rejects a total `> INT32_MAX`,
+  so an absurd argument pile cannot wrap the size and defeat `osc_build_finish`'s
+  capacity check.
+- **LOW** The last two raw pointer-cast reads in vendored tinyosc
+  (`tosc_getNextBlob` length, `tosc_isBundle`) now read via `memcpy`, completing the
+  alignment-safety pass - the misaligned-load class is fully closed.
+- `oscParse` now preserves a **nested bundle** (a bundle element that is itself a
+  bundle) by recursing in the LCB layer, instead of collapsing it to an empty message.
+- `osc_arg_string` now NUL-terminates the caller buffer on the too-small path
+  (matching `copy_str`/`osc_address`); documented that the three handle namespaces
+  (builders / bundle builders / parsed messages) are disjoint and must not be crossed.
+
+**MIDI:**
+- **MEDIUM** The drain stash is now **pre-allocated per input port at open** (65535 B),
+  so the drain hot path never `malloc`s and a buffer-full stash can never drop a
+  popped message on OOM - the "never drop a popped message" invariant now holds
+  unconditionally (previously a stash `malloc` failure silently lost the message).
+- A drained message larger than 65535 B (un-representable in the 2-byte record
+  length) now sets a last-error when dropped (was silent); it never wedges the port.
+- The `double`->`uint32` delta conversion is NaN/range-guarded (defence in depth now
+  that float-cast-overflow is gated).
+- `midi_in_drain`'s returned count can no longer exceed `max_msgs` (the stash flush
+  is gated on `max_msgs > 0`).
+
+**Tests / CI / docs:**
+- OSC smoke test -> **63 assertions** (added nested-bundle parse, out-of-range
+  float->int32 saturation, and bundle-element-overflow rejection).
+- New `tests/midi_mock_smoke_test.c` + `tests/mock/rtmidi_c.h`: a controllable
+  RtMidi **mock** that exercises the drain / stash / oversize / port-name / `max_msgs`
+  paths deterministically under sanitizers - on every platform and even where RtMidi
+  cannot be fetched - covering what the hardware-dependent `midi_smoke` test cannot.
+  Wired into CMake/CTest as `midi_mock_smoke` (independent of `SHOWCONTROL_BUILD_MIDI`).
+- The CI ASan/UBSan gate adds `float-cast-overflow`.
+- `README.md` replaced with a comprehensive, as-built front-door README; the
+  original strategy/implementation plan preserved at `docs/project-plan.md`.
+
 ### Pre-OXT hardening - security & robustness
 
 A full pre-release review of all three extensions (each layer audited under
@@ -90,9 +143,10 @@ exists) surfaced LiveCode Builder syntax issues the static checker didn't cover:
   `oscMatch`, `oscLastError` (+ the Linux native-loader helpers).
 - 64-bit ints / timetags cross the FFI as decimal strings (no 64-bit foreign
   type in the engine).
-- `tests/osc_smoke_test.c`: 55 assertions incl. every-type round-trip, bundles,
-  matching, malformed-datagram fuzzing, and the hardening regressions above -
-  green under ASan + UBSan with `-fno-sanitize-recover=all`.
+- `tests/osc_smoke_test.c`: 63 assertions incl. every-type round-trip, bundles
+  (incl. nested), matching, malformed-datagram fuzzing, float->int saturation, and
+  the hardening regressions above - green under ASan + UBSan + float-cast-overflow
+  with `-fno-sanitize-recover=all`.
 
 ### MIDI (`midi`, ABI 1)
 - C shim `src/midi/midi_shim.c` over RtMidi (fetched, MIT): enumerate/open/close

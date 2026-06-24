@@ -19,6 +19,14 @@
  *     positive 32-bit int handle; 0 means null/invalid. Handles are
  *     generation-tagged, so a stale handle stays a harmless no-op after its slot
  *     is recycled. Treat them as opaque.
+ *     NOTE: the three handle kinds -- message builders (osc_build_*), bundle
+ *     builders (osc_bundle_*), and parsed messages (osc_parse / osc_arg_* /
+ *     osc_*_free) -- live in SEPARATE tables that each start numbering at 1, so a
+ *     value is only meaningful to the kind that issued it. A handle is validated
+ *     against its own table, so crossing kinds is never memory-unsafe (it is a
+ *     harmless no-op / 0-return), but it IS a logic error: pass each handle only
+ *     to functions of its own kind. The LCB binding keeps them in separate
+ *     variables and never mixes them.
  *   - Byte buffers cross as a (pointer, length) pair: the caller (LCB) passes a
  *     pointer to its bytes and an int length. The shim NEVER returns a
  *     library-owned `const char*` (a known engine-crash footgun); every string /

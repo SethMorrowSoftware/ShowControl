@@ -429,12 +429,23 @@ private handler buildBundleArray(in pH as Integer) returns Array
    put [] into tMessages
    variable i as Integer
    variable tSub as Integer
+   variable tSubIsBundle as Integer
    if tCount > 0 then
       repeat with i from 0 up to tCount - 1
          unsafe
             put _bundle_message(pH, i) into tSub
          end unsafe
-         push messageArray(tSub) onto tMessages
+         -- A bundle element may itself be a bundle (OSC allows nesting; the C
+         -- parser already validated it, depth-capped). Recurse so a nested bundle
+         -- keeps its structure instead of collapsing to an empty message.
+         unsafe
+            put _is_bundle(tSub) into tSubIsBundle
+         end unsafe
+         if tSubIsBundle is 1 then
+            push buildBundleArray(tSub) onto tMessages
+         else
+            push messageArray(tSub) onto tMessages
+         end if
       end repeat
    end if
    put tMessages into tArr["messages"]

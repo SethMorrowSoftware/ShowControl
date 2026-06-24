@@ -130,6 +130,30 @@ int main(void) {
     check("bundle msg1 is /b", strcmp(sbuf, "/b") == 0);
     osc_parse_free(pb);                  /* frees sub-messages too */
 
+    /* ---- nested bundle: a bundle element that is itself a bundle keeps its
+       structure (the LCB layer recurses on this; prove the C parser supports it) ---- */
+    { uint8_t inner[64];
+      int32_t hi = osc_build_new("/inner"); osc_build_add_int32(hi, 7);
+      int32_t ni = osc_build_finish(hi, inner, sizeof inner); osc_build_free(hi);
+      int32_t ib = osc_bundle_new(1);            /* inner bundle holding /inner */
+      osc_bundle_add_message(ib, inner, ni);
+      uint8_t innerb[96];
+      int32_t nib = osc_bundle_finish(ib, innerb, sizeof innerb); osc_bundle_free(ib);
+      int32_t ob = osc_bundle_new(1);            /* outer bundle holding the inner bundle */
+      osc_bundle_add_message(ob, innerb, nib);
+      uint8_t outerb[160];
+      int32_t nob = osc_bundle_finish(ob, outerb, sizeof outerb); osc_bundle_free(ob);
+
+      int32_t po = osc_parse(outerb, nob);
+      check("nested bundle parses", po != 0 && osc_is_bundle(po) && osc_bundle_count(po) == 1);
+      int32_t child = osc_bundle_message(po, 0);
+      check("nested element is itself a bundle", osc_is_bundle(child) == 1);
+      check("nested bundle has the inner message", osc_bundle_count(child) == 1);
+      int32_t leaf = osc_bundle_message(child, 0);
+      osc_address(leaf, sbuf, sizeof sbuf);
+      check("nested leaf is /inner == 7", strcmp(sbuf, "/inner") == 0 && osc_arg_int32(leaf,0,&ok)==7 && ok);
+      osc_parse_free(po); }
+
     /* ---- address pattern matching ---- */
     check("'*' matches a segment",         osc_match("/1/fader*", "/1/fader1") == 1);
     check("'*' stops at '/'",              osc_match("/*/x", "/a/x") == 1);
@@ -189,6 +213,33 @@ int main(void) {
       osc_arg_int64_str(hhh, 0, sbuf, sizeof sbuf);
       check("int64 'h' stays signed (-1)", strcmp(sbuf, "-1") == 0);
       osc_parse_free(hhh); }
+    { /* out-of-range float/double coerced to int32 must NOT be UB (float-cast-
+         overflow): a hostile OSC float argument read as an int saturates, no trap.
+         Build it with -fsanitize=float-cast-overflow to make this assertion bite. */
+      int32_t hb = osc_build_new("/coerce");
+      osc_build_add_float(hb, 1e30f);            /* far above INT32_MAX */
+      osc_build_add_double(hb, -1e300);          /* far below INT32_MIN */
+      uint8_t cb[64];
+      int32_t cn = osc_build_finish(hb, cb, sizeof cb);
+      osc_build_free(hb);
+      int32_t cm = osc_parse(cb, cn);
+      int32_t v0 = osc_arg_int32(cm, 0, &ok);
+      check("huge float -> int32 saturates to INT32_MAX (no UB)", v0 == 2147483647 && ok);
+      int32_t v1 = osc_arg_int32(cm, 1, &ok);
+      check("huge -double -> int32 saturates to INT32_MIN (no UB)", v1 == (-2147483647 - 1) && ok);
+      osc_parse_free(cm); }
+
+    { /* a bundle element length near INT32_MAX must be rejected, not overflow the
+         4+len size math and write through an unsized buffer (reproduced a segfault
+         in pre-release review). msg is a real 1-byte pointer so only the size guard
+         can stop it. */
+      int32_t hb = osc_bundle_new(1);
+      uint8_t one = 0;
+      int32_t r = osc_bundle_add_message(hb, &one, 2147483646);   /* 4 + len overflows int32 */
+      check("huge bundle element rejected (no overflow/crash)", r == 0);
+      check("bundle in error state finishes as 0", osc_bundle_finish(hb, buf, sizeof buf) == 0);
+      osc_bundle_free(hb); }
+
     { /* a pathological '*'-heavy pattern must return promptly, not hang (ReDoS) */
       char pat[128] = "/"; char str[128] = "/";
       for (int i = 0; i < 20; i++) strcat(pat, "*a");

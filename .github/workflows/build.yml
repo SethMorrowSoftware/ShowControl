@@ -52,14 +52,19 @@ jobs:
         # OSC datagram) sails through a green CI. -fno-sanitize-recover=all makes
         # every sanitizer ABORT on the first error, and the *_OPTIONS reinforce it,
         # so this gate actually gates -- which is the whole point of running it.
+        #
+        # NOTE: float-cast-overflow is NOT in the default -fsanitize=undefined group
+        # (it was split out), yet an out-of-range float->int coercion IS undefined
+        # behaviour and IS reachable from a hostile OSC float argument. Add it
+        # explicitly so that class is gated too.
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
         run: |
           cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
             -DSHOWCONTROL_BUILD_TESTS=ON \
-            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
-            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer"
           cmake --build build-asan -j
           ctest --test-dir build-asan --output-on-failure
 
