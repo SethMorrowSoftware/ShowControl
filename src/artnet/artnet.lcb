@@ -100,6 +100,16 @@ private handler fieldText(in pData as Data, in pStart as Integer, in pWidth as I
    return tStr
 end handler
 
+-- LiveCode Builder has no integer-division operator -- 'div' is LiveCode Script
+-- only and does not parse in LCB. Compute floor division for non-negative
+-- integers: a - (a mod b) is an exact multiple of b, so dividing gives the exact
+-- quotient. (Defined before first use.)
+private handler intDiv(in pA as Integer, in pB as Integer) returns Integer
+   variable tQ as Integer
+   put (pA - (pA mod pB)) / pB into tQ
+   return tQ
+end handler
+
 -- =====================================================================
 -- Output: ArtDmx
 -- =====================================================================
@@ -134,18 +144,18 @@ public handler artnetBuildDmx(in pUniverse as Integer, in pChannels as Data) ret
    put artnetId() into tPkt
    -- OpCode 0x5000, LITTLE-endian (low byte first)
    put numToByte(kOpDmx mod 256) after tPkt
-   put numToByte((kOpDmx div 256) mod 256) after tPkt
+   put numToByte(intDiv(kOpDmx, 256) mod 256) after tPkt
    -- Protocol version, BIG-endian (high byte first)
-   put numToByte((kProtoVer div 256) mod 256) after tPkt
+   put numToByte(intDiv(kProtoVer, 256) mod 256) after tPkt
    put numToByte(kProtoVer mod 256) after tPkt
    -- Sequence (0 = ordering disabled) + Physical (informational)
    put numToByte(0) after tPkt
    put numToByte(0) after tPkt
    -- SubUni (low byte) then Net (high 7 bits) of the 15-bit port-address
    put numToByte(pUniverse mod 256) after tPkt
-   put numToByte((pUniverse div 256) mod 128) after tPkt
+   put numToByte(intDiv(pUniverse, 256) mod 128) after tPkt
    -- Length, BIG-endian (high byte first)
-   put numToByte((tLen div 256) mod 256) after tPkt
+   put numToByte(intDiv(tLen, 256) mod 256) after tPkt
    put numToByte(tLen mod 256) after tPkt
    -- DMX data
    put fitChannels(pChannels, tLen) after tPkt
@@ -222,9 +232,9 @@ public handler artnetBuildPoll() returns Data
    put artnetId() into tPkt
    -- OpCode 0x2000, little-endian
    put numToByte(kOpPoll mod 256) after tPkt
-   put numToByte((kOpPoll div 256) mod 256) after tPkt
+   put numToByte(intDiv(kOpPoll, 256) mod 256) after tPkt
    -- Protocol version, big-endian
-   put numToByte((kProtoVer div 256) mod 256) after tPkt
+   put numToByte(intDiv(kProtoVer, 256) mod 256) after tPkt
    put numToByte(kProtoVer mod 256) after tPkt
    -- TalkToMe flags (0) + Priority (0)
    put numToByte(0) after tPkt

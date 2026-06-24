@@ -59,6 +59,16 @@ variable sDrainReady as Boolean
 -- re-emitted, permanently wedging the input port. (Allocated just once.)
 private constant kDrainCap is 65541
 
+-- LiveCode Builder has no integer-division operator -- 'div' is LiveCode Script
+-- only and does not parse in LCB. Compute floor division for non-negative
+-- integers: a - (a mod b) is an exact multiple of b, so dividing gives the exact
+-- quotient. (Defined before first use.)
+private handler intDiv(in pA as Integer, in pB as Integer) returns Integer
+   variable tQ as Integer
+   put (pA - (pA mod pB)) / pB into tQ
+   return tQ
+end handler
+
 private handler ensureDrainBuf()
    if sDrainReady is true then
       return
@@ -75,7 +85,7 @@ private handler ensureDrainBuf()
    end repeat
    variable tBuf as Data
    put the empty data into tBuf
-   repeat with i from 1 up to ((kDrainCap div 256) + 1)
+   repeat with i from 1 up to (intDiv(kDrainCap, 256) + 1)
       put tChunk after tBuf
    end repeat
    put byte 1 to kDrainCap of tBuf into sDrain
@@ -272,7 +282,7 @@ end handler
 -- 14-bit pitch bend, 0..16383 (8192 = centre).
 public handler midiPitchBend(in pHandle as Integer, in pChannel as Integer, in pValue14bit as Integer)
    -- Clamp to the 14-bit range first; otherwise a negative or >16383 value makes
-   -- the mod/div below produce out-of-range (or negative) data bytes.
+   -- the mod / intDiv below produce out-of-range (or negative) data bytes.
    variable tVal as Integer
    put pValue14bit into tVal
    if tVal < 0 then
@@ -284,7 +294,7 @@ public handler midiPitchBend(in pHandle as Integer, in pChannel as Integer, in p
    variable tLsb as Integer
    variable tMsb as Integer
    put tVal mod 128 into tLsb
-   put (tVal div 128) mod 128 into tMsb
+   put intDiv(tVal, 128) mod 128 into tMsb
    send3(pHandle, 224 + chanNib(pChannel), tLsb, tMsb, 3)
 end handler
 
