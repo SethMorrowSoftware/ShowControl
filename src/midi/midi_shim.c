@@ -205,9 +205,23 @@ static int32_t open_port(int is_input, int32_t portIndex, const char *vname) {
     }
     midi_port mp; memset(&mp, 0, sizeof mp);
     mp.ptr = d; mp.is_input = is_input;
+    if (is_input) {
+        /* Pre-allocate the drain stash up front, sized to the largest message the
+         * 2-byte record length can carry (65535 B). The drain hot path then NEVER
+         * mallocs, so a buffer-full stash can never drop a popped message on OOM --
+         * the "never drop a popped message" invariant (CLAUDE.md gotcha #6) holds
+         * unconditionally, not just when a runtime malloc happens to succeed. */
+        mp.stash = (uint8_t*) malloc(65535);
+        if (!mp.stash) {
+            err_set("midi: out of memory");
+            rtmidi_in_free(d);
+            return 0;
+        }
+    }
     int32_t h = tbl_add(mp);
     if (!h) {
         err_set("midi: handle table full");
+        free(mp.stash);   /* NULL for outputs; the input stash if we got one */
         if (is_input) rtmidi_in_free(d); else rtmidi_out_free(d);
         return 0;
     }
@@ -265,10 +279,12 @@ MIDI_API int32_t midi_in_drain(int32_t handle, uint8_t *out, int32_t out_cap, in
      * out_cap and can NEVER fit -- drop it (with a diagnostic) rather than
      * returning 0 forever and wedging the port until midiClose. With the LCB
      * binding's kDrainCap >= the max record size (2 + 65535 + 4) this drop path
-     * is unreachable; it is defense-in-depth for any smaller caller buffer. */
-    if (mp->has_stash) {
+     * is unreachable; it is defense-in-depth for any smaller caller buffer.
+     * Gated on max_msgs > 0 so a caller asking for 0 messages gets 0 (and keeps
+     * its stash for next time) -- the return count never exceeds max_msgs. */
+    if (mp->has_stash && max_msgs > 0) {
         int wrote = emit_record(out, out_cap, &pos, mp->stash, mp->stash_len, mp->stash_delta_us);
-        free(mp->stash); mp->stash = NULL; mp->has_stash = 0;
+        mp->has_stash = 0;        /* mark empty; keep the buffer (freed only at close) */
         if (wrote) {
             count++;
         } else {
@@ -281,19 +297,26 @@ MIDI_API int32_t midi_in_drain(int32_t handle, uint8_t *out, int32_t out_cap, in
         size_t sz = sizeof tmp;
         double delta = rtmidi_in_get_message(mp->ptr, tmp, &sz);
         if (sz == 0) break;                       /* queue empty */
-        if (sz > 65535) continue;                 /* implausibly large -> skip */
-        if (delta < 0) delta = 0;
+        if (sz > 65535) {                         /* SysEx beyond the 2-byte record length */
+            /* RtMidi already popped it; the [2B len] record format cannot carry it,
+             * so it is dropped. Note it (don't wedge). Real-world SysEx is far smaller. */
+            err_set("midi: dropped an inbound message larger than 65535 bytes");
+            continue;
+        }
+        if (!(delta >= 0)) delta = 0;     /* clamp negative AND NaN (NaN fails every compare) */
         double us = delta * 1.0e6;
-        uint32_t delta_us = (us > 4294967295.0) ? 4294967295u : (uint32_t) us;
+        /* Guard the double->uint32 conversion: out-of-range/NaN float-to-int is UB
+         * (float-cast-overflow). RtMidi's delta is a finite, non-negative duration,
+         * so this only ever clamps a pathological value -- defence in depth. */
+        uint32_t delta_us = (us >= 4294967295.0) ? 4294967295u : (uint32_t) us;
         if (!emit_record(out, out_cap, &pos, tmp, (int32_t) sz, delta_us)) {
-            /* doesn't fit: stash it so the next drain delivers it (no drop) */
-            mp->stash = (uint8_t*) malloc(sz ? sz : 1);
-            if (mp->stash) {
-                memcpy(mp->stash, tmp, sz);
-                mp->stash_len = (int32_t) sz;
-                mp->stash_delta_us = delta_us;
-                mp->has_stash = 1;
-            }
+            /* doesn't fit this drain: stash into the per-port buffer (pre-allocated
+             * at open, capacity 65535 >= sz) so the next drain delivers it. No malloc
+             * here means this can never fail and never drop the popped message. */
+            memcpy(mp->stash, tmp, sz);
+            mp->stash_len = (int32_t) sz;
+            mp->stash_delta_us = delta_us;
+            mp->has_stash = 1;
             break;
         }
         count++;

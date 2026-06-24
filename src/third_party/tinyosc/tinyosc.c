@@ -58,7 +58,8 @@ int tosc_parseMessage(tosc_message *o, char *buffer, const int len) {
 
 // check if first eight bytes are '#bundle '
 bool tosc_isBundle(const char *buffer) {
-  return ((*(const int64_t *) buffer) == htonll(BUNDLE_ID));
+  int64_t b; memcpy(&b, buffer, 8); // ShowControl: alignment-safe, see getNextInt32
+  return (b == htonll(BUNDLE_ID));
 }
 
 void tosc_parseBundle(tosc_bundle *b, char *buffer, const int len) {
@@ -144,7 +145,8 @@ const char *tosc_getNextString(tosc_message *o) {
 }
 
 void tosc_getNextBlob(tosc_message *o, const char **buffer, int *len) {
-  int i = (int) ntohl(*((uint32_t *) o->marker)); // get the blob length
+  uint32_t bl; memcpy(&bl, o->marker, 4); // ShowControl: alignment-safe, see getNextInt32
+  int i = (int) ntohl(bl); // get the blob length
   if (o->marker + 4 + i <= o->buffer + o->len) {
     *len = i; // length of blob
     *buffer = o->marker + 4;

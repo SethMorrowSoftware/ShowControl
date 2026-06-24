@@ -253,10 +253,13 @@ OSC_API int32_t osc_build_add_blob(int32_t h, const uint8_t *data, int32_t len) 
     return 1;
 }
 
-/* Compute the exact serialized size of the current builder, or -1 on bad model. */
+/* Compute the exact serialized size of the current builder, or -1 on bad model
+ * (unknown type, or a total that would overflow int32). Accumulate in int64 so a
+ * pathological pile of args cannot wrap the running sum and make osc_build_finish's
+ * `out_cap < need` test pass against a too-small buffer. */
 static int32_t builder_size(builder *b) {
-    int32_t sz = pad4((int32_t)strlen(b->address) + 1);   /* address + NUL, padded */
-    sz += pad4(b->count + 2);                              /* ',' + tags + NUL, padded */
+    int64_t sz = pad4((int32_t)strlen(b->address) + 1);   /* address + NUL, padded */
+    sz += pad4(b->count + 2);                             /* ',' + tags + NUL, padded */
     for (int32_t k = 0; k < b->count; k++) {
         build_arg *a = &b->args[k];
         switch (a->type) {
@@ -267,8 +270,9 @@ static int32_t builder_size(builder *b) {
             case 'T': case 'F': case 'N': case 'I': break;
             default: return -1;
         }
+        if (sz > INT32_MAX) return -1;
     }
-    return sz;
+    return (int32_t) sz;
 }
 
 OSC_API int32_t osc_build_finish(int32_t h, uint8_t *out, int32_t out_cap) {
@@ -335,12 +339,19 @@ typedef struct {
 DEFINE_PTR_TABLE(bundles, bundle_builder)
 
 static int bundle_reserve(bundle_builder *b, int32_t extra) {
-    if (b->len + extra > b->cap) {
-        int32_t nc = b->cap ? b->cap * 2 : 64;
-        while (nc < b->len + extra) nc *= 2;
+    /* All size math in int64 so a hostile/huge `extra` cannot overflow int32 and
+     * wrap the capacity test (which would skip the realloc and let the caller
+     * write past the buffer). The capacity stays a sane int32. */
+    if (extra < 0) { b->ok = 0; return 0; }
+    int64_t need = (int64_t) b->len + extra;
+    if (need > INT32_MAX) { b->ok = 0; return 0; }
+    if (need > b->cap) {
+        int64_t nc = b->cap ? (int64_t) b->cap * 2 : 64;
+        while (nc < need) nc *= 2;
+        if (nc > INT32_MAX) nc = INT32_MAX;
         uint8_t *nb = (uint8_t*) realloc(b->buf, (size_t)nc);
         if (!nb) { b->ok = 0; return 0; }
-        b->buf = nb; b->cap = nc;
+        b->buf = nb; b->cap = (int32_t) nc;
     }
     return 1;
 }
@@ -363,6 +374,12 @@ OSC_API int32_t osc_bundle_add_message(int32_t h, const uint8_t *msg, int32_t le
     bundle_builder *b = bundles_get(h);
     if (!b) return 0;
     if (len < 0 || !msg) { b->ok = 0; return 0; }
+    /* Bound the element so 4+len (the size prefix + payload) and the running total
+     * cannot overflow int32. Without this, a len near INT32_MAX wraps 4+len negative,
+     * the reserve is skipped, and the memcpy below writes through an unsized buffer. */
+    if ((int64_t) b->len + 4 + len > INT32_MAX) {
+        b->ok = 0; err_set("oscBuildBundle: bundle too large"); return 0;
+    }
     if (!bundle_reserve(b, 4 + len)) return 0;
     be32_store(b->buf + b->len, (uint32_t)len);   /* element size prefix */
     b->len += 4;
@@ -638,11 +655,23 @@ static parsed_arg *arg_at(int32_t h, int32_t i) {
     return &m->args[i];
 }
 
+/* Saturating double->int32. A parsed OSC float/double comes off the network, so a
+ * value outside the int32 range is expected, not exceptional -- and the bare cast
+ * `(int32_t)d` for such a value is UNDEFINED BEHAVIOUR in C (C11 6.3.1.4), which a
+ * float-cast-overflow build flags and which can trap or be miscompiled on some
+ * targets. Clamp to the int32 range (NaN -> 0) so the coercion is always defined.
+ * INT32_MIN/MAX are exactly representable as double, so the bounds are exact. */
+static int32_t d_to_i32(double d) {
+    if (d != d) return 0;                       /* NaN */
+    if (d >= 2147483647.0)  return 2147483647;  /* INT32_MAX */
+    if (d <= -2147483648.0) return -2147483647 - 1; /* INT32_MIN (no 2147483648 literal) */
+    return (int32_t) d;
+}
+
 OSC_API int32_t osc_arg_int32(int32_t h, int32_t i, int32_t *ok) {
     parsed_arg *a = arg_at(h, i);
     if (a && (a->type=='i' || a->type=='h')) { if(ok)*ok=1; return (int32_t)a->i; }
-    if (a && a->type=='f') { if(ok)*ok=1; return (int32_t)a->d; }
-    if (a && a->type=='d') { if(ok)*ok=1; return (int32_t)a->d; }
+    if (a && (a->type=='f' || a->type=='d')) { if(ok)*ok=1; return d_to_i32(a->d); }
     if (ok) { *ok = 0; } return 0;
 }
 OSC_API int64_t osc_arg_int64(int32_t h, int32_t i, int32_t *ok) {
@@ -672,7 +701,10 @@ OSC_API int32_t osc_arg_string(int32_t h, int32_t i, char *out, int32_t out_cap)
     parsed_msg *m = parsed_get(h);
     if (!a || a->type != 's') return -1;
     int32_t n = a->len;
-    if (!out || out_cap < n + 1) return -(n + 1);
+    if (!out || out_cap < n + 1) {
+        if (out && out_cap > 0) out[0] = '\0';   /* match copy_str: NUL-terminate on too-small */
+        return -(n + 1);
+    }
     memcpy(out, m->data + a->off, (size_t)n);
     out[n] = '\0';
     return n;

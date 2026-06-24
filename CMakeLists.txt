@@ -129,6 +129,30 @@ if(SHOWCONTROL_BUILD_MIDI)
     endif()
 endif()
 
+# ===========================================================================
+# Mock-RtMidi smoke test: compiles the MIDI shim against a controllable RtMidi
+# mock (tests/mock/rtmidi_c.h) so the drain / stash / handle-table logic runs
+# DETERMINISTICALLY -- on every platform, under sanitizers, and even where the
+# real RtMidi cannot be fetched (no network) or no MIDI backend exists. It does
+# what the hardware-dependent midi_smoke test cannot: inject inbound messages and
+# assert the batched-drain wire format and the "never drop a popped message"
+# stash. Independent of SHOWCONTROL_BUILD_MIDI (it never touches real RtMidi).
+# ===========================================================================
+if(SHOWCONTROL_BUILD_TESTS)
+    add_executable(midi_mock_smoke
+        src/midi/midi_shim.c
+        tests/midi_mock_smoke_test.c)
+    # tests/mock FIRST so the shim's #include "rtmidi_c.h" resolves to the mock.
+    target_include_directories(midi_mock_smoke PRIVATE tests/mock src/midi)
+    set_target_properties(midi_mock_smoke PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED ON)
+    if(MSVC)
+        target_compile_options(midi_mock_smoke PRIVATE /W3)
+    else()
+        target_compile_options(midi_mock_smoke PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME midi_mock_smoke COMMAND midi_mock_smoke)
+endif()
+
 # Build:
 #   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build --config Release
