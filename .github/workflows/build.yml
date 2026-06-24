@@ -160,3 +160,92 @@ jobs:
         run: |
           echo "Attaching binaries to release: $TAG"
           gh release upload "$TAG" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+
+  # When the osc/midi shim SOURCES change on main (or on a manual run), take the
+  # per-platform binaries this workflow just built and drop them into the committed
+  # src/<ext>/code/<platform-id>/ trees, then open/update ONE PR with the result.
+  # This automates what tools/package-extension.py does by hand.
+  #
+  # Why a PR (not a direct push to main): the compiled libraries are NOT
+  # byte-reproducible (build-ids / timestamps differ run to run), and main may be
+  # branch-protected. A PR keeps main's history clean, is reviewable, and works
+  # regardless of protection. The job is gated to ACTUAL shim-source changes so it
+  # never churns on doc-only pushes, and code/ is excluded from the trigger diff so
+  # merging the refresh PR can't re-trigger it (no loop).
+  #
+  # One-time repo setting this needs: Settings -> Actions -> General ->
+  # "Allow GitHub Actions to create and approve pull requests". (A PR opened by the
+  # built-in GITHUB_TOKEN does not itself trigger CI -- which is fine here: the
+  # binaries were already built and tested by the jobs above, and it avoids a loop.)
+  package-binaries:
+    name: refresh committed code/ trees (open a PR)
+    needs: [ build-linux, build-native ]
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # need history to diff the push range
+      - name: Decide whether a refresh is warranted
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual run -> refresh"; echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          base="${{ github.event.before }}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Refresh only when the shim SOURCES changed -- not on doc-only pushes, and
+          # not on a code/ binary commit (excluded), so the refresh PR can't loop.
+          if git diff --name-only "$base" "${{ github.sha }}" -- \
+               src/osc src/midi src/third_party CMakeLists.txt ':(exclude)src/**/code/**' \
+               | grep -q .; then
+            echo "shim sources changed -> refresh"; echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no shim source change -> skip"; echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download the built per-platform binaries
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          merge-multiple: true
+      - name: Place binaries into src/<ext>/code/<platform-id>/
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          # Map the staged artifact names onto the committed slots. 32-bit Linux
+          # (x86-linux) is not built by CI yet, so that slot is left untouched.
+          python3 tools/package-extension.py \
+            --osc-linux64 dl/osc-linux-x86_64.so       --midi-linux64 dl/midi-linux-x86_64.so \
+            --osc-mac     dl/osc-macos-universal.dylib  --midi-mac    dl/midi-macos-universal.dylib \
+            --osc-win64   dl/osc-windows-x64.dll        --midi-win64  dl/midi-windows-x64.dll \
+            --osc-win32   dl/osc-windows-x86.dll        --midi-win32  dl/midi-windows-x86.dll
+          python3 tools/package-extension.py --check || true   # informational (x86-linux stays empty)
+      - name: Open or update the refresh PR
+        if: steps.gate.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="ci/refresh-native-binaries"
+          git checkout -B "$branch"                 # branch from current main, keep the placed files
+          git add src/osc/code src/midi/code
+          if git diff --cached --quiet; then
+            echo "Built binaries are identical to the committed ones; nothing to do."
+            exit 0
+          fi
+          git commit -m "CI: refresh committed native binaries from ${GITHUB_SHA::7} [skip ci]"
+          git push -f origin "$branch"
+          open_count=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq 'length')
+          if [ "$open_count" -gt 0 ]; then
+            echo "Existing open PR was updated by the force-push."
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+              --title "CI: refresh committed native binaries" \
+              --body "Automated refresh of \`src/<ext>/code/<platform-id>/\` from the latest build of \`osc_shim.c\` / \`midi_shim.c\` (source commit ${GITHUB_SHA::7}), built and tested by the \`build\` workflow. Merge to update the committed, ready-to-package binaries. 32-bit Linux (\`x86-linux\`) is not built by CI yet, so that slot is unchanged."
+          fi

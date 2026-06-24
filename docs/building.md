@@ -153,8 +153,20 @@ OXT Lite) - **no library download, no renaming, no sudo, no `/usr/lib`, no
 
 ## Refreshing the committed binaries
 
-`tools/package-extension.py` refreshes the committed `code/` trees when you have a
-newer build - point each flag at the matching built library:
+**CI does this for you.** When the `osc`/`midi` shim sources change on `main` (or on
+a manual `workflow_dispatch`), the `build` workflow's **`package-binaries`** job
+takes the per-platform libraries it just built and tested, drops them into the
+committed `src/<ext>/code/<platform-id>/` slots, and **opens (or updates) a pull
+request** on the branch `ci/refresh-native-binaries`. Review and merge that PR to
+refresh the committed, ready-to-package binaries. It is gated to actual shim-source
+changes (no churn on doc-only pushes) and excludes `code/` from its trigger so
+merging the refresh PR can't loop. (One-time repo setting: *Settings -> Actions ->
+General -> "Allow GitHub Actions to create and approve pull requests."* Note the
+compiled libraries are not byte-reproducible across runs, which is why this is a
+reviewable PR rather than an automatic commit to `main`.)
+
+**Doing it by hand.** `tools/package-extension.py` is the manual equivalent (and what
+the CI job calls) - point each flag at the matching built library:
 
 ```sh
 python3 tools/package-extension.py --check                       # list/validate the committed trees
@@ -243,9 +255,19 @@ is covered by byte-exact golden-packet fixtures and validated against Wireshark
 on native **Linux**, **macOS** (universal arm64 + x86_64), and **Windows** runners
 on every push and pull request, enabling `-DSHOWCONTROL_BUILD_TESTS=ON` so `ctest`
 runs the OSC and MIDI smoke tests on each (the MIDI test passes headless by
-design). A separate gate also builds the C smoke tests under AddressSanitizer +
-UndefinedBehaviorSanitizer with `-fno-sanitize-recover=all`, so any memory or UB
-error fails the build rather than only printing.
+design; the RtMidi-free `midi_mock_smoke` exercises the drain/stash logic too). A
+separate gate also builds the C smoke tests under AddressSanitizer +
+UndefinedBehaviorSanitizer + `float-cast-overflow` with `-fno-sanitize-recover=all`,
+so any memory or UB error fails the build rather than only printing.
+
+When the **osc/midi shim sources change on `main`** (or on a manual
+`workflow_dispatch`), the **`package-binaries`** job drops the freshly-built
+per-platform libraries into the committed `src/<ext>/code/<platform-id>/` trees and
+opens/updates a pull request (`ci/refresh-native-binaries`) with the result - so the
+committed binaries stay in step with the source without a manual
+`package-extension.py` run. See
+[Refreshing the committed binaries](#refreshing-the-committed-binaries) for the
+gating and the one repo setting it needs.
 
 When a GitHub [Release](../../releases) is **published** (or via a manual
 `workflow_dispatch` with a `release_tag`), CI gathers each platform's `osc` and
