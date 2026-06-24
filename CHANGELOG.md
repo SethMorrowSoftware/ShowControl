@@ -54,6 +54,19 @@ Address/UndefinedBehavior sanitizers where buildable). Fixes by severity:
 - Docs reconciled with the as-built code: binding names, the helper-script location,
   `package-extension.py` flags, the release trigger, MIDI `value14`, Art-Net parse keys.
 
+### First OXT compile pass (LiveCode Builder syntax)
+
+The first real OpenXTalk compile of the `.lcb` bindings (no headless LCB compiler
+exists) surfaced LiveCode Builder syntax issues the static checker didn't cover:
+- **Missing module terminator** - every `library ...` must be closed with
+  `end library`; none of the three were, so the parser ran to EOF and reported a
+  bare "syntax error" at end-of-file on all three bindings. Added `end library` to
+  osc/midi/artnet, plus a new `check-livecodescript.py` gate that flags an
+  unterminated `module`/`library`/`widget`.
+- **`div` is LiveCode Script only** - LCB has no integer-division operator (the
+  compiler accepts `mod` but rejects `div`). Replaced every `div` with an `intDiv`
+  helper (floor division via `a - (a mod b)`): artnet x6, midi x2.
+
 ### OSC (`osc`, ABI 1)
 - C shim `src/osc/osc_shim.c` over vendored tinyosc (ISC): a non-variadic
   incremental message builder, bundle builder, and a **bounds-checked** indexed

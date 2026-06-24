@@ -480,3 +480,5 @@ public handler oscLoadNativeLibError() returns String
    end if
    return tErr
 end handler
+
+end library
