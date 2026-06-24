@@ -8,6 +8,19 @@ where they diverge; the project as a whole tracks the headline milestones below.
 The initial implementation scaffold: a verified native core, the three LCB
 bindings, the build/test/CI machinery, and the documentation set.
 
+### CI: auto-refresh the committed native binaries via PR
+
+The `build` workflow gained a **`package-binaries`** job that automates the manual
+`tools/package-extension.py` step. When the `osc`/`midi` shim sources change on
+`main` (or on a manual `workflow_dispatch`), it takes the per-platform libraries the
+matrix just built and tested, drops them into the committed
+`src/<ext>/code/<platform-id>/` slots, and **opens/updates a pull request**
+(`ci/refresh-native-binaries`). A PR (not a direct push) because the compiled libs
+are not byte-reproducible and `main` may be protected; the job is gated to actual
+shim-source changes (no doc-push churn) and excludes `code/` from its trigger diff
+so merging the refresh PR can't loop. Needs the one-time repo setting *Allow GitHub
+Actions to create and approve pull requests*. (`docs/building.md` documents it.)
+
 ### Hardware-free in-OXT test kit
 
 Ways to validate the whole stack inside OpenXTalk with no controllers, DAWs, or
@@ -209,9 +222,10 @@ exists) surfaced LiveCode Builder syntax issues the static checker didn't cover:
   x86_64 on a standard runner. **`x86-linux` is not yet built**, so that bundle
   slot ships empty until a job is added (or the slot is dropped) - decide before
   the first release.
-- Automate populating the committed `code/<platform-id>/` trees from release
-  assets (CI attaches flat per-platform files; refresh is currently a manual
-  `package-extension.py` step) and wire `--check` into CI once slots are populated.
+- ~~Automate populating the committed `code/<platform-id>/` trees~~ - **done**: the
+  `package-binaries` CI job opens a refresh PR when the shim sources change. Still
+  open: wire `package-extension.py --check` into CI as a required gate once every
+  populated slot (incl. 32-bit Linux) is filled.
 - macOS code-signing + notarization of the osc/midi dylibs (Gatekeeper will block
   the unsigned artifacts CI currently ships); Art-Net is exempt.
 - Pin RtMidi by commit SHA rather than the movable `GIT_TAG 6.0.0` for fully
