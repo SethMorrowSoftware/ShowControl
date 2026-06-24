@@ -237,6 +237,38 @@ def check_lcb_module(text):
 
 
 # ---------------------------------------------------------------------------
+# LiveCode Builder script-ism gate: constructs that are valid LiveCode Script
+# but DO NOT EXIST in LiveCode Builder. Each of these was hit on the first OXT
+# compile pass; flag them statically so they cannot regress.
+# ---------------------------------------------------------------------------
+LCB_FORBIDDEN = (
+    (re.compile(r"\bnumToByte\s*\("), "numToByte() is LiveCode Script -- LCB uses 'the byte with code (n)'"),
+    (re.compile(r"\bbyteToNum\s*\("), "byteToNum() is LiveCode Script -- LCB uses 'the code of (b)'"),
+    (re.compile(r"\bnumToChar\s*\("), "numToChar() is LiveCode Script -- LCB uses 'the char with code (n)'"),
+    (re.compile(r"\bcharToNum\s*\("), "charToNum() is LiveCode Script -- LCB uses 'the code of (c)'"),
+    (re.compile(r"\bdiv\b"),          "'div' is LiveCode Script -- LCB has no integer-division operator"),
+    (re.compile(r"\bor\b"),           "'or' is not an LCB operator (commented out in logic.lcb) -- restructure the condition"),
+    (re.compile(r"\band\b"),          "'and' is not an LCB operator (commented out in logic.lcb) -- restructure the condition"),
+)
+
+
+def check_lcb_scriptisms(text):
+    """Flag LiveCode Script-only constructs that are not valid LiveCode Builder.
+    Runs on comment- and string-stripped code so the same words appearing in
+    prose or string literals are ignored."""
+    # blank /* */ block comments (preserve newlines so line numbers stay accurate)
+    clean = re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
+    errors = []
+    for lineno, raw in enumerate(clean.split("\n"), 1):
+        code = strip_comment(raw)                       # drop trailing -- comment
+        code = re.sub(r'"[^"]*"', '""', code)           # neutralise string-literal contents
+        for rx, msg in LCB_FORBIDDEN:
+            if rx.search(code):
+                errors.append(f"  L{lineno}: {msg}")
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # LiveCodeScript (.livecodescript) structure + dangling-else gates.
 # ---------------------------------------------------------------------------
 
@@ -339,6 +371,7 @@ def lint_file(path, kind):
     if kind == "lcb":
         problems += check_lcb_structure(text)
         problems += check_lcb_module(text)
+        problems += check_lcb_scriptisms(text)
     else:
         problems += check_script_structure(text)
         problems += check_dangling_else(text)

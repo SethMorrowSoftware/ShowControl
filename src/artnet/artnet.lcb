@@ -95,7 +95,7 @@ private handler fieldText(in pData as Data, in pStart as Integer, in pWidth as I
       if tByte is 0 then
          exit repeat
       end if
-      put tStr & numToChar(tByte) into tStr
+      put tStr & (the char with code (tByte)) into tStr
    end repeat
    return tStr
 end handler
@@ -124,7 +124,12 @@ public handler artnetBuildDmx(in pUniverse as Integer, in pChannels as Data) ret
    -- 256) throw (out of the 0..255 byte domain), and a universe > 32767 would be
    -- silently masked into a different (wrong) universe -- driving the wrong rig.
    -- The API contract is "failure is quiet, never thrown": set last-error, return empty.
-   if pUniverse < 0 or pUniverse > 32767 then
+   -- LCB has no 'or' operator, so test the two out-of-range cases separately.
+   if pUniverse < 0 then
+      put "artnetBuildDmx: universe out of range 0..32767" into sLastError
+      return the empty data
+   end if
+   if pUniverse > 32767 then
       put "artnetBuildDmx: universe out of range 0..32767" into sLastError
       return the empty data
    end if

@@ -310,7 +310,12 @@ private handler readArg(in pH as Integer, in pIndex as Integer) returns any
          put _arg_string_z(pH, pIndex) into tStr
       end unsafe
       return tStr
-   else if tType is 104 or tType is 116 then  -- 'h' / 't'
+   else if tType is 104 then   -- 'h' int64
+      unsafe
+         put _arg_int64_z(pH, pIndex) into tStr
+      end unsafe
+      return tStr
+   else if tType is 116 then   -- 't' timetag (LCB has no 'or', so a separate branch)
       unsafe
          put _arg_int64_z(pH, pIndex) into tStr
       end unsafe
