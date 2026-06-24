@@ -53,9 +53,10 @@ private foreign handler _abi_version() returns CInt binds to "c:osc>osc_abi_vers
 
 -- building
 private foreign handler _build_new(in pAddr as ZStringUTF8) returns CInt binds to "c:osc>osc_build_new!cdecl"
-private foreign handler _build_add_int32(in pH as CInt, in pV as CInt) returns CInt binds to "c:osc>osc_build_add_int32!cdecl"
-private foreign handler _build_add_float(in pH as CInt, in pV as CFloat) returns CInt binds to "c:osc>osc_build_add_float!cdecl"
-private foreign handler _build_add_double(in pH as CInt, in pV as CDouble) returns CInt binds to "c:osc>osc_build_add_double!cdecl"
+-- Numeric build args go through the *_str entry points (see addArg); the engine
+-- hands script numbers to a foreign `any` as strings, and LCB will not coerce a
+-- decimal string to its Number type. (The non-str osc_build_add_int32/_float/_double
+-- C symbols still exist for the C smoke test, but the binding does not use them.)
 private foreign handler _build_add_string(in pH as CInt, in pV as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_string!cdecl"
 private foreign handler _build_add_blob(in pH as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_build_add_blob!cdecl"
 private foreign handler _build_add_true(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_true!cdecl"
@@ -64,6 +65,12 @@ private foreign handler _build_add_nil(in pH as CInt) returns CInt binds to "c:o
 private foreign handler _build_add_impulse(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_impulse!cdecl"
 private foreign handler _build_add_int64_str(in pH as CInt, in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_int64_str!cdecl"
 private foreign handler _build_add_timetag_str(in pH as CInt, in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_timetag_str!cdecl"
+-- Numeric build args cross as decimal STRINGS (ABI 2): the engine hands a script
+-- number to a foreign `any` as a string, and LCB will not coerce a decimal string
+-- to its Number type, so we pass the string and parse it in C (as for int64).
+private foreign handler _build_add_int32_str(in pH as CInt, in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_int32_str!cdecl"
+private foreign handler _build_add_float_str(in pH as CInt, in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_float_str!cdecl"
+private foreign handler _build_add_double_str(in pH as CInt, in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_double_str!cdecl"
 private foreign handler _build_finish(in pH as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_build_finish!cdecl"
 private foreign handler _build_free(in pH as CInt) returns nothing binds to "c:osc>osc_build_free!cdecl"
 
@@ -137,8 +144,8 @@ private handler checkABI()
    unsafe
       put _abi_version() into tV
    end unsafe
-   if tV is not 1 then
-      throw "osc: incompatible native library (binding needs ABI 1) - update the osc shim"
+   if tV is not 2 then
+      throw "osc: incompatible native library (binding needs ABI 2) - rebuild/repackage the osc shim"
    end if
 end handler
 
@@ -147,21 +154,23 @@ end handler
 -- =====================================================================
 -- Append one [type, value] pair to an open builder handle.
 private handler addArg(in pH as Integer, in pType as String, in pValue as any) returns Boolean
-   variable tNum as Number
    variable tStr as String
    variable tData as Data
    variable tOk as Boolean
    put true into tOk
+   -- Every numeric value crosses to C as a decimal STRING. `put pValue into tStr`
+   -- (any -> String) always succeeds, whereas `put pValue into <Number>` fails for
+   -- a decimal value the engine handed us as a string (e.g. 0.5). C parses it.
    unsafe
       if pType is "i" then
-         put pValue into tNum
-         _build_add_int32(pH, tNum)
+         put pValue into tStr
+         _build_add_int32_str(pH, tStr)
       else if pType is "f" then
-         put pValue into tNum
-         _build_add_float(pH, tNum)
+         put pValue into tStr
+         _build_add_float_str(pH, tStr)
       else if pType is "d" then
-         put pValue into tNum
-         _build_add_double(pH, tNum)
+         put pValue into tStr
+         _build_add_double_str(pH, tStr)
       else if pType is "s" then
          put pValue into tStr
          _build_add_string(pH, tStr)
@@ -222,8 +231,13 @@ private handler finishToData(in pH as Integer, in pKind as String) returns Data
 end handler
 
 -- oscBuildMessage(pAddress, pArgs) -> Data
---   pArgs is a list of [type, value] pairs, e.g. [["f",0.5],["s","hi"],["i",3]].
---   Types: i f s b (Data) h t (decimal String) d  T F N I (no value).
+--   pArgs is a FLAT list alternating type, value, type, value, ... -- e.g. the
+--   elements "i", 3, "f", 0.5, "s", "hi". The scAddArg helper (in
+--   examples/showcontrol-helpers.livecodescript) builds exactly this for you.
+--   Types: i f s b (Data) h t (decimal String) d  T F N I (no value -- pass empty).
+--   Why flat and NOT a list of [type, value] pairs: a nested LiveCode Script array
+--   does not survive the Script->LCB boundary as a list-of-lists -- the inner pair
+--   arrives as an Array, not a List -- so we flatten to scalars, which cross cleanly.
 public handler oscBuildMessage(in pAddress as String, in pArgs as List) returns Data
    checkABI()
    variable tH as Integer
@@ -233,15 +247,27 @@ public handler oscBuildMessage(in pAddress as String, in pArgs as List) returns 
    if tH is 0 then
       return the empty data
    end if
-   variable tPair as List
+   -- Walk the flat list two elements at a time: odd element = type code, even = value.
+   -- tType is carried as 'any' (not String) so it binds to addArg's String parameter
+   -- exactly the way the original list-element value did -- a coercion proven to work.
+   variable tElem as any
+   variable tType as any
+   variable tHaveType as Boolean
    variable tArgOk as Boolean
-   repeat for each element tPair in pArgs
-      put addArg(tH, element 1 of tPair, element 2 of tPair) into tArgOk
-      if not tArgOk then
-         unsafe
-            _build_free(tH)
-         end unsafe
-         return the empty data        -- unknown type code: fail quietly, build nothing
+   put false into tHaveType
+   repeat for each element tElem in pArgs
+      if not tHaveType then
+         put tElem into tType
+         put true into tHaveType
+      else
+         put addArg(tH, tType, tElem) into tArgOk
+         put false into tHaveType
+         if not tArgOk then
+            unsafe
+               _build_free(tH)
+            end unsafe
+            return the empty data        -- unknown type code: fail quietly, build nothing
+         end if
       end if
    end repeat
    variable tResult as Data

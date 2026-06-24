@@ -53,8 +53,11 @@
 extern "C" {
 #endif
 
-/* Bump whenever the exported ABI changes so the .lcb can sanity-check. */
-#define OSC_ABI_VERSION 1
+/* Bump whenever the exported ABI changes so the .lcb can sanity-check.
+ * v2: added osc_build_add_int32_str / _float_str / _double_str (numeric build args
+ *     cross as decimal strings; the engine hands script numbers to a foreign `any`
+ *     as strings and LCB will not coerce a decimal string to Number). */
+#define OSC_ABI_VERSION 2
 
 OSC_API int32_t  osc_abi_version(void);
 
@@ -80,6 +83,12 @@ OSC_API int32_t  osc_build_add_timetag(int32_t h, uint64_t ntp);
  * is naturally a string there anyway). */
 OSC_API int32_t  osc_build_add_int64_str  (int32_t h, const char *dec);
 OSC_API int32_t  osc_build_add_timetag_str(int32_t h, const char *dec);
+/* int32 / float / double as decimal strings too (ABI 2). The engine passes script
+ * numbers to a foreign `any` as strings and LCB will not coerce a decimal string
+ * to its Number type, so the .lcb stringifies every numeric arg and we parse here. */
+OSC_API int32_t  osc_build_add_int32_str  (int32_t h, const char *dec);
+OSC_API int32_t  osc_build_add_float_str  (int32_t h, const char *dec);
+OSC_API int32_t  osc_build_add_double_str (int32_t h, const char *dec);
 /* Serialize the OSC message into the caller buffer. Returns bytes written, or
  * -needed (negative) if out_cap is too small (call again with a bigger buffer),
  * or 0 on a bad handle. Does not free the builder. */

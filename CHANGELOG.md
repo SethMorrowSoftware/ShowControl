@@ -8,6 +8,35 @@ where they diverge; the project as a whole tracks the headline milestones below.
 The initial implementation scaffold: a verified native core, the three LCB
 bindings, the build/test/CI machinery, and the documentation set.
 
+### First OXT runtime pass - OSC build path (osc ABI -> 2)
+
+Real OpenXTalk runs of the OSC build path surfaced issues no static gate could:
+- **`[...]` list literals don't exist in LiveCode Script** (that is LiveCode
+  Builder syntax) - the example scripts used them and failed to compile. Build OSC
+  args by assignment via the `scAddArg` helper; a new `check-livecodescript.py`
+  gate flags any `[...]` literal in a `.livecodescript`.
+- **Nested Script arrays don't marshal to an LCB list-of-lists.** `oscBuildMessage`
+  took a list of `[type, value]` pairs, but each inner pair arrived as an LCB
+  `Array`, not a `List`. Switched to a **flat** args list (`type, value, type, ...`,
+  all scalars, which cross cleanly); the `scAddArg` API is unchanged.
+- **Numeric build args must cross as decimal strings (osc ABI 1 -> 2).** The engine
+  hands a script number to a foreign `any` as a string, and LCB will not coerce a
+  decimal string (e.g. `0.5`) to its `Number` type - so `put pValue into <Number>`
+  threw. Added `osc_build_add_int32_str` / `_float_str` / `_double_str`; the binding
+  now stringifies every numeric arg and the shim parses it in C (as it already did
+  for int64). **A rebuilt osc binary (ABI 2) is required**; `checkABI()` throws a
+  clear "rebuild the osc shim" error against an old ABI-1 binary.
+- **Builder bug found in the process (now fixed):** `osc_build_finish` did not
+  NUL-terminate the type-tag string when `','+tags` was itself a multiple of 4
+  (argument count % 4 == 3, i.e. 3/7/11/... args), so the args ran into the tag
+  region and the datagram failed to parse. The existing tests never used a count
+  of 3; the new ABI-2 test (3 args: `ifd`) is the regression. OSC smoke test now
+  67 assertions, green under ASan + UBSan + float-cast-overflow.
+- The `Data` round-trip / `Array` access patterns in the examples and docs were
+  corrected to the forms that actually work (`tArr[1]` not `item 1 of`, etc.), and
+  the datagram receive handlers now tolerate the engine-dependent callback
+  parameter order.
+
 ### CI: auto-refresh the committed native binaries via PR
 
 The `build` workflow gained a **`package-binaries`** job that automates the manual

@@ -217,6 +217,22 @@ OSC_API int32_t osc_build_add_int64_str(int32_t h, const char *dec) {
     int64_t v = dec ? (int64_t) strtoll(dec, NULL, 10) : 0;
     return build_scalar(h, 'h', v, 0);
 }
+/* int32 / float / double also cross as decimal strings. The xTalk engine passes
+ * script numbers into a foreign `any` as their STRING form, and LCB will not
+ * coerce a decimal string ("0.5") to its Number type on assignment -- so the .lcb
+ * stringifies every numeric value and we parse it here, exactly as for int64. */
+OSC_API int32_t osc_build_add_int32_str(int32_t h, const char *dec) {
+    long v = dec ? strtol(dec, NULL, 10) : 0;
+    return build_scalar(h, 'i', (int64_t)(int32_t) v, 0);
+}
+OSC_API int32_t osc_build_add_float_str(int32_t h, const char *dec) {
+    double v = dec ? strtod(dec, NULL) : 0.0;
+    return build_scalar(h, 'f', 0, v);
+}
+OSC_API int32_t osc_build_add_double_str(int32_t h, const char *dec) {
+    double v = dec ? strtod(dec, NULL) : 0.0;
+    return build_scalar(h, 'd', 0, v);
+}
 OSC_API int32_t osc_build_add_timetag_str(int32_t h, const char *dec) {
     uint64_t v = dec ? (uint64_t) strtoull(dec, NULL, 10) : 0;
     return build_scalar(h, 't', (int64_t) v, 0);
@@ -292,7 +308,13 @@ OSC_API int32_t osc_build_finish(int32_t h, uint8_t *out, int32_t out_cap) {
 
     out[i++] = ',';
     for (int32_t k = 0; k < b->count; k++) out[i++] = (uint8_t) b->args[k].type;
-    i = pad4(i);                       /* pad past the typetag NUL run */
+    /* The type-tag string MUST be NUL-terminated, then padded to a multiple of 4.
+     * pad4(i+1) (not pad4(i)) guarantees at least one NUL even when ','+tags is
+     * itself a multiple of 4 (i.e. argCount % 4 == 3); the memset above already
+     * zeroed the padding. The old pad4(i) left a 3/7/11/...-arg message with NO
+     * type-tag terminator, so the args ran into the tag region and it failed to
+     * parse. builder_size already reserves pad4(count+2), so this never overruns. */
+    i = pad4(i + 1);
 
     for (int32_t k = 0; k < b->count; k++) {
         build_arg *a = &b->args[k];

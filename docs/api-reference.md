@@ -78,9 +78,13 @@ OSC datagram as `Data`, ready to `write ... to socket`.
 > put oscBuildMessage("/synth/note", tArgs) into tData
 > ```
 >
-> `scAddArg` is just `put pType into tPair[1]; put pValue into tPair[2]; put tPair
-> into pArgs[(the number of elements of pArgs) + 1]`. (Inside a `.lcb`, the `[...]`
-> literal *is* valid - this caveat is only for the LiveCode Script side.)
+> `scAddArg` just appends the type then the value as two consecutive elements
+> (`put pType into pArgs[(the number of elements of pArgs) + 1]` then the same for
+> `pValue`). The args cross as a **flat** list - `["i", 60, "f", 0.8]`, not a list of
+> `[type, value]` sub-lists - because a nested LiveCode array does not survive the
+> Script->LCB boundary as a list-of-lists (the inner pair arrives as an Array, not a
+> List). `oscBuildMessage` walks the flat list two elements at a time. (Inside a
+> `.lcb`, the `[...]` literal *is* valid - this caveat is only for LiveCode Script.)
 
 **Fails** (returns empty, sets last-error) on a null/over-long address, an unknown
 type code, or a value that cannot be coerced to the declared type.
