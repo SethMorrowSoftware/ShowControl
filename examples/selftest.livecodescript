@@ -317,15 +317,14 @@ end stLooksLikePacket
 
 -- ===== reporting ===========================================================
 
--- Append one OSC [type, value] pair to an args array passed BY REFERENCE. xTalk
--- has no [...] list-literal expression, so this is how you build the args you pass
--- to oscBuildMessage. (Self-contained copy of showcontrol-helpers' scAddArg, named
--- with the st prefix so this file stays standalone.)
+-- Append one OSC type/value pair as TWO consecutive elements (a FLAT list -- a
+-- nested LiveCode array does not survive Script->LCB as a list-of-lists, so the
+-- args are flattened to scalars) to an args array passed BY REFERENCE. xTalk has
+-- no [...] list-literal expression, so this is how you build the args you pass to
+-- oscBuildMessage. (Self-contained copy of showcontrol-helpers' scAddArg.)
 private command stAddArg @pArgs, pType, pValue
-   local tPair
-   put pType into tPair[1]
-   put pValue into tPair[2]
-   put tPair into pArgs[(the number of elements of pArgs) + 1]
+   put pType into pArgs[(the number of elements of pArgs) + 1]
+   put pValue into pArgs[(the number of elements of pArgs) + 1]
 end stAddArg
 
 private command stSection pTitle

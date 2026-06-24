@@ -222,8 +222,13 @@ private handler finishToData(in pH as Integer, in pKind as String) returns Data
 end handler
 
 -- oscBuildMessage(pAddress, pArgs) -> Data
---   pArgs is a list of [type, value] pairs, e.g. [["f",0.5],["s","hi"],["i",3]].
---   Types: i f s b (Data) h t (decimal String) d  T F N I (no value).
+--   pArgs is a FLAT list alternating type, value, type, value, ... -- e.g. the
+--   elements "i", 3, "f", 0.5, "s", "hi". The scAddArg helper (in
+--   examples/showcontrol-helpers.livecodescript) builds exactly this for you.
+--   Types: i f s b (Data) h t (decimal String) d  T F N I (no value -- pass empty).
+--   Why flat and NOT a list of [type, value] pairs: a nested LiveCode Script array
+--   does not survive the Script->LCB boundary as a list-of-lists -- the inner pair
+--   arrives as an Array, not a List -- so we flatten to scalars, which cross cleanly.
 public handler oscBuildMessage(in pAddress as String, in pArgs as List) returns Data
    checkABI()
    variable tH as Integer
@@ -233,15 +238,27 @@ public handler oscBuildMessage(in pAddress as String, in pArgs as List) returns 
    if tH is 0 then
       return the empty data
    end if
-   variable tPair as List
+   -- Walk the flat list two elements at a time: odd element = type code, even = value.
+   -- tType is carried as 'any' (not String) so it binds to addArg's String parameter
+   -- exactly the way the original list-element value did -- a coercion proven to work.
+   variable tElem as any
+   variable tType as any
+   variable tHaveType as Boolean
    variable tArgOk as Boolean
-   repeat for each element tPair in pArgs
-      put addArg(tH, element 1 of tPair, element 2 of tPair) into tArgOk
-      if not tArgOk then
-         unsafe
-            _build_free(tH)
-         end unsafe
-         return the empty data        -- unknown type code: fail quietly, build nothing
+   put false into tHaveType
+   repeat for each element tElem in pArgs
+      if not tHaveType then
+         put tElem into tType
+         put true into tHaveType
+      else
+         put addArg(tH, tType, tElem) into tArgOk
+         put false into tHaveType
+         if not tArgOk then
+            unsafe
+               _build_free(tH)
+            end unsafe
+            return the empty data        -- unknown type code: fail quietly, build nothing
+         end if
       end if
    end repeat
    variable tResult as Data
