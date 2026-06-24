@@ -45,14 +45,14 @@ variable sLastError as String
 -- The 8-byte Art-Net ID: ASCII "Art-Net" + a NUL terminator.
 private handler artnetId() returns Data
    variable tId as Data
-   put numToByte(65) into tId      -- A
-   put numToByte(114) after tId    -- r
-   put numToByte(116) after tId    -- t
-   put numToByte(45) after tId     -- -
-   put numToByte(78) after tId     -- N
-   put numToByte(101) after tId    -- e
-   put numToByte(116) after tId    -- t
-   put numToByte(0) after tId      -- NUL
+   put the byte with code (65) into tId      -- A
+   put the byte with code (114) after tId    -- r
+   put the byte with code (116) after tId    -- t
+   put the byte with code (45) after tId     -- -
+   put the byte with code (78) after tId     -- N
+   put the byte with code (101) after tId    -- e
+   put the byte with code (116) after tId    -- t
+   put the byte with code (0) after tId      -- NUL
    return tId
 end handler
 
@@ -73,7 +73,7 @@ private handler fitChannels(in pChannels as Data, in pLen as Integer) returns Da
       put the empty data into tOut
    end if
    variable tZero as Data
-   put numToByte(0) into tZero
+   put the byte with code (0) into tZero
    variable i as Integer
    repeat with i from tN + 1 up to pLen
       put tZero after tOut
@@ -91,11 +91,11 @@ private handler fieldText(in pData as Data, in pStart as Integer, in pWidth as I
       if i > the number of bytes in pData then
          exit repeat
       end if
-      put byteToNum(byte i of pData) into tByte
+      put the code of (byte i of pData) into tByte
       if tByte is 0 then
          exit repeat
       end if
-      put tStr & numToChar(tByte) into tStr
+      put tStr & (the char with code (tByte)) into tStr
    end repeat
    return tStr
 end handler
@@ -120,11 +120,16 @@ end handler
 public handler artnetBuildDmx(in pUniverse as Integer, in pChannels as Data) returns Data
    put the empty string into sLastError
    -- Reject an out-of-range port-address BEFORE packing. LCB's mod follows the
-   -- sign of the dividend, so a negative universe makes numToByte(pUniverse mod
+   -- sign of the dividend, so a negative universe makes the byte with code (pUniverse mod
    -- 256) throw (out of the 0..255 byte domain), and a universe > 32767 would be
    -- silently masked into a different (wrong) universe -- driving the wrong rig.
    -- The API contract is "failure is quiet, never thrown": set last-error, return empty.
-   if pUniverse < 0 or pUniverse > 32767 then
+   -- LCB has no 'or' operator, so test the two out-of-range cases separately.
+   if pUniverse < 0 then
+      put "artnetBuildDmx: universe out of range 0..32767" into sLastError
+      return the empty data
+   end if
+   if pUniverse > 32767 then
       put "artnetBuildDmx: universe out of range 0..32767" into sLastError
       return the empty data
    end if
@@ -143,20 +148,20 @@ public handler artnetBuildDmx(in pUniverse as Integer, in pChannels as Data) ret
    variable tPkt as Data
    put artnetId() into tPkt
    -- OpCode 0x5000, LITTLE-endian (low byte first)
-   put numToByte(kOpDmx mod 256) after tPkt
-   put numToByte(intDiv(kOpDmx, 256) mod 256) after tPkt
+   put the byte with code (kOpDmx mod 256) after tPkt
+   put the byte with code (intDiv(kOpDmx, 256) mod 256) after tPkt
    -- Protocol version, BIG-endian (high byte first)
-   put numToByte(intDiv(kProtoVer, 256) mod 256) after tPkt
-   put numToByte(kProtoVer mod 256) after tPkt
+   put the byte with code (intDiv(kProtoVer, 256) mod 256) after tPkt
+   put the byte with code (kProtoVer mod 256) after tPkt
    -- Sequence (0 = ordering disabled) + Physical (informational)
-   put numToByte(0) after tPkt
-   put numToByte(0) after tPkt
+   put the byte with code (0) after tPkt
+   put the byte with code (0) after tPkt
    -- SubUni (low byte) then Net (high 7 bits) of the 15-bit port-address
-   put numToByte(pUniverse mod 256) after tPkt
-   put numToByte(intDiv(pUniverse, 256) mod 128) after tPkt
+   put the byte with code (pUniverse mod 256) after tPkt
+   put the byte with code (intDiv(pUniverse, 256) mod 128) after tPkt
    -- Length, BIG-endian (high byte first)
-   put numToByte(intDiv(tLen, 256) mod 256) after tPkt
-   put numToByte(tLen mod 256) after tPkt
+   put the byte with code (intDiv(tLen, 256) mod 256) after tPkt
+   put the byte with code (tLen mod 256) after tPkt
    -- DMX data
    put fitChannels(pChannels, tLen) after tPkt
    return tPkt
@@ -183,7 +188,7 @@ public handler artnetParseDmx(in pData as Data) returns Array
    end if
    -- OpCode is little-endian
    variable tOp as Integer
-   put byteToNum(byte 9 of pData) + byteToNum(byte 10 of pData) * 256 into tOp
+   put the code of (byte 9 of pData) + the code of (byte 10 of pData) * 256 into tOp
    if tOp is not kOpDmx then
       put "artnetParseDmx: not an ArtDmx opcode" into sLastError
       return tArr
@@ -192,13 +197,13 @@ public handler artnetParseDmx(in pData as Data) returns Array
    variable tPhys as Integer
    variable tSub as Integer
    variable tNet as Integer
-   put byteToNum(byte 13 of pData) into tSeq
-   put byteToNum(byte 14 of pData) into tPhys
-   put byteToNum(byte 15 of pData) into tSub
-   put byteToNum(byte 16 of pData) into tNet
+   put the code of (byte 13 of pData) into tSeq
+   put the code of (byte 14 of pData) into tPhys
+   put the code of (byte 15 of pData) into tSub
+   put the code of (byte 16 of pData) into tNet
    -- Length is big-endian
    variable tLen as Integer
-   put byteToNum(byte 17 of pData) * 256 + byteToNum(byte 18 of pData) into tLen
+   put the code of (byte 17 of pData) * 256 + the code of (byte 18 of pData) into tLen
    if tLen > 512 then
       put 512 into tLen           -- Art-Net DMX is 512 channels max; clamp a bad field
    end if
@@ -231,14 +236,14 @@ public handler artnetBuildPoll() returns Data
    variable tPkt as Data
    put artnetId() into tPkt
    -- OpCode 0x2000, little-endian
-   put numToByte(kOpPoll mod 256) after tPkt
-   put numToByte(intDiv(kOpPoll, 256) mod 256) after tPkt
+   put the byte with code (kOpPoll mod 256) after tPkt
+   put the byte with code (intDiv(kOpPoll, 256) mod 256) after tPkt
    -- Protocol version, big-endian
-   put numToByte(intDiv(kProtoVer, 256) mod 256) after tPkt
-   put numToByte(kProtoVer mod 256) after tPkt
+   put the byte with code (intDiv(kProtoVer, 256) mod 256) after tPkt
+   put the byte with code (kProtoVer mod 256) after tPkt
    -- TalkToMe flags (0) + Priority (0)
-   put numToByte(0) after tPkt
-   put numToByte(0) after tPkt
+   put the byte with code (0) after tPkt
+   put the byte with code (0) after tPkt
    return tPkt
 end handler
 
@@ -258,7 +263,7 @@ public handler artnetParseReply(in pData as Data) returns Array
       return tArr
    end if
    variable tOp as Integer
-   put byteToNum(byte 9 of pData) + byteToNum(byte 10 of pData) * 256 into tOp
+   put the code of (byte 9 of pData) + the code of (byte 10 of pData) * 256 into tOp
    if tOp is not kOpPollReply then
       put "artnetParseReply: not an ArtPollReply opcode" into sLastError
       return tArr
@@ -266,12 +271,16 @@ public handler artnetParseReply(in pData as Data) returns Array
    put "ArtPollReply" into tArr["opcode"]
    -- IP address: 4 bytes at offset 11..14 (1-based)
    variable tIp as String
-   put byteToNum(byte 11 of pData) & "." & byteToNum(byte 12 of pData) & "." \
-     & byteToNum(byte 13 of pData) & "." & byteToNum(byte 14 of pData) into tIp
+   -- LCB '&' concatenates Strings only; the code of (...) is an Integer, so format
+   -- each octet to its decimal string before joining with ".".
+   put (the code of (byte 11 of pData) formatted as string) & "." \
+     & (the code of (byte 12 of pData) formatted as string) & "." \
+     & (the code of (byte 13 of pData) formatted as string) & "." \
+     & (the code of (byte 14 of pData) formatted as string) into tIp
    put tIp into tArr["ip"]
    -- NetSwitch (offset 19) / SubSwitch (offset 20)
-   put byteToNum(byte 19 of pData) into tArr["net"]
-   put byteToNum(byte 20 of pData) into tArr["subuni"]
+   put the code of (byte 19 of pData) into tArr["net"]
+   put the code of (byte 20 of pData) into tArr["subuni"]
    -- ShortName: 18 bytes at offset 27; LongName: 64 bytes at offset 45
    put fieldText(pData, 27, 18) into tArr["shortName"]
    if the number of bytes in pData >= 45 then
@@ -290,28 +299,28 @@ private handler isArtNet(in pData as Data) returns Boolean
       return false
    end if
    -- bytes 1..7 == "Art-Net", byte 8 == 0
-   if byteToNum(byte 1 of pData) is not 65 then
+   if the code of (byte 1 of pData) is not 65 then
       return false
    end if
-   if byteToNum(byte 2 of pData) is not 114 then
+   if the code of (byte 2 of pData) is not 114 then
       return false
    end if
-   if byteToNum(byte 3 of pData) is not 116 then
+   if the code of (byte 3 of pData) is not 116 then
       return false
    end if
-   if byteToNum(byte 4 of pData) is not 45 then
+   if the code of (byte 4 of pData) is not 45 then
       return false
    end if
-   if byteToNum(byte 5 of pData) is not 78 then
+   if the code of (byte 5 of pData) is not 78 then
       return false
    end if
-   if byteToNum(byte 6 of pData) is not 101 then
+   if the code of (byte 6 of pData) is not 101 then
       return false
    end if
-   if byteToNum(byte 7 of pData) is not 116 then
+   if the code of (byte 7 of pData) is not 116 then
       return false
    end if
-   if byteToNum(byte 8 of pData) is not 0 then
+   if the code of (byte 8 of pData) is not 0 then
       return false
    end if
    return true

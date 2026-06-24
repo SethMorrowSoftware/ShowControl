@@ -81,7 +81,7 @@ private handler ensureDrainBuf()
    put the empty data into tChunk
    variable i as Integer
    repeat with i from 1 up to 256
-      put numToByte(0) after tChunk
+      put the byte with code (0) after tChunk
    end repeat
    variable tBuf as Data
    put the empty data into tBuf
@@ -249,12 +249,12 @@ end handler
 -- Pack up to three bytes into Data and send.
 private handler send3(in pHandle as Integer, in pStatus as Integer, in pD1 as Integer, in pD2 as Integer, in pLen as Integer)
    variable tMsg as Data
-   put numToByte(pStatus) into tMsg
+   put the byte with code (pStatus) into tMsg
    if pLen >= 2 then
-      put numToByte(clamp7(pD1)) after tMsg
+      put the byte with code (clamp7(pD1)) after tMsg
    end if
    if pLen >= 3 then
-      put numToByte(clamp7(pD2)) after tMsg
+      put the byte with code (clamp7(pD2)) after tMsg
    end if
    midiSend(pHandle, tMsg)
 end handler
@@ -321,7 +321,7 @@ public handler midiPoll(in pHandle as Integer) returns List
    repeat with k from 1 up to tCount
       -- [2 bytes len BE]
       variable tLen as Integer
-      put byteToNum(byte tPos of sDrain) * 256 + byteToNum(byte (tPos + 1) of sDrain) into tLen
+      put the code of (byte tPos of sDrain) * 256 + the code of (byte (tPos + 1) of sDrain) into tLen
       put tPos + 2 into tPos
       -- [len bytes message]
       variable tBytes as Data
@@ -333,10 +333,10 @@ public handler midiPoll(in pHandle as Integer) returns List
       put tPos + tLen into tPos
       -- [4 bytes delta micros BE]
       variable tDeltaUs as Integer
-      put byteToNum(byte tPos of sDrain) * 16777216 \
-        + byteToNum(byte (tPos + 1) of sDrain) * 65536 \
-        + byteToNum(byte (tPos + 2) of sDrain) * 256 \
-        + byteToNum(byte (tPos + 3) of sDrain) into tDeltaUs
+      put the code of (byte tPos of sDrain) * 16777216 \
+        + the code of (byte (tPos + 1) of sDrain) * 65536 \
+        + the code of (byte (tPos + 2) of sDrain) * 256 \
+        + the code of (byte (tPos + 3) of sDrain) into tDeltaUs
       put tPos + 4 into tPos
       push decodeEvent(tBytes, tDeltaUs) onto tEvents
    end repeat
@@ -355,16 +355,16 @@ private handler decodeEvent(in pBytes as Data, in pDeltaUs as Integer) returns A
       return tRec
    end if
    variable tStatus as Integer
-   put byteToNum(byte 1 of pBytes) into tStatus
+   put the code of (byte 1 of pBytes) into tStatus
    variable tD1 as Integer
    variable tD2 as Integer
    put 0 into tD1
    put 0 into tD2
    if tN >= 2 then
-      put byteToNum(byte 2 of pBytes) into tD1
+      put the code of (byte 2 of pBytes) into tD1
    end if
    if tN >= 3 then
-      put byteToNum(byte 3 of pBytes) into tD2
+      put the code of (byte 3 of pBytes) into tD2
    end if
    put tD1 into tRec["data1"]
    put tD2 into tRec["data2"]

@@ -66,6 +66,20 @@ exists) surfaced LiveCode Builder syntax issues the static checker didn't cover:
 - **`div` is LiveCode Script only** - LCB has no integer-division operator (the
   compiler accepts `mod` but rejects `div`). Replaced every `div` with an `intDiv`
   helper (floor division via `a - (a mod b)`): artnet x6, midi x2.
+- **`numToByte`/`byteToNum` are LiveCode Script names** - LCB spells them
+  `the byte with code <n>` and `the code of <byte>` (`com.livecode.byte`). Replaced
+  all 65 uses. The ArtPollReply IP string additionally needed each octet
+  `formatted as string` before `&`, since LCB's `&` concatenates Strings only.
+- **`and`/`or` and `numToChar` are LiveCode Script too** - found by a full audit of
+  all three bindings against the LCB stdlib sources. LCB has no `and`/`or` boolean
+  operators (commented out in `logic.lcb`; only `not`) and no `numToChar`. Rewrote
+  the two `or` conditions (osc `readArg`, artnet universe guard) as separate branches,
+  and replaced `numToChar` with `the char with code`. The audit also confirmed the
+  numeric model (`Integer`==`Real`==`Number`, so the `intDiv`/arithmetic assignments
+  are correct) and that the builtin syntax modules are implicitly in scope.
+- **check-livecodescript.py** gained a script-ism gate that flags every LiveCode
+  Script-only construct we hit (`numToByte`/`byteToNum`/`numToChar`/`charToNum`/`div`/
+  `and`/`or`) in `.lcb` files, so none can regress.
 
 ### OSC (`osc`, ABI 1)
 - C shim `src/osc/osc_shim.c` over vendored tinyosc (ISC): a non-variadic
