@@ -34,7 +34,7 @@ on openCard
       if sMidiIn is 0 then
          scLog "Could not open MIDI input:" && midiLastError()
       else
-         scLog "Listening to MIDI port:" && (element 1 of tPorts)
+         scLog "Listening to MIDI port:" && (tPorts[1])
          scMidiStartListening sMidiIn, 3
       end if
    end if
@@ -62,8 +62,11 @@ end scMidiCC
 
 on scNoteOn pChannel, pNote, pVelocity
    scLog "Note on:" && pNote && "vel" && pVelocity
-   -- echo the note straight out as OSC, TouchOSC-style
-   scOscSend sOscHost, sOscPort, ("/note/" & pNote), [["i", pVelocity]]
+   -- echo the note straight out as OSC, TouchOSC-style. Build the args array with
+   -- scAddArg (xTalk has no [...] list literal -- see showcontrol-helpers).
+   local tArgs
+   scAddArg tArgs, "i", pVelocity
+   scOscSend sOscHost, sOscPort, ("/note/" & pNote), tArgs
 end scNoteOn
 
 -- ===== the on-screen fader (mouse or MIDI both land here) ==================
@@ -76,9 +79,10 @@ end scrollbarDrag
 
 -- Forward a 0..127 master level to OSC (normalized 0..1) and Art-Net (0..255).
 private command forwardMaster pValue127
-   local tNorm, tDmx
+   local tNorm, tDmx, tArgs
    put pValue127 / 127 into tNorm
-   scOscSend sOscHost, sOscPort, "/master/level", [["f", tNorm]]
+   scAddArg tArgs, "f", tNorm
+   scOscSend sOscHost, sOscPort, "/master/level", tArgs
 
    put round(tNorm * 255) into tDmx
    scArtnetSend sArtnetHost, 0, scArtnetOneChannel(1, tDmx)
@@ -93,7 +97,7 @@ on scOscDatagram pData, pSender
       -- a remote surface moved our master; reflect it locally
       local tArgs
       put tMsg["args"] into tArgs
-      set the thumbPosition of scrollbar "Master" to round((element 1 of tArgs) * 127)
+      set the thumbPosition of scrollbar "Master" to round((tArgs[1]) * 127)
    end if
    read from socket pSender for 65535
 end scOscDatagram

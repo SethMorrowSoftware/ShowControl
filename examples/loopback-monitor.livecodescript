@@ -121,30 +121,58 @@ end scRenderDmx
 -- ===== OSC echo ============================================================
 
 command scSendOsc
-   local tText
+   local tText, tPair, tArgs
    put the text of field "scOscIn" into tText
    if tText is empty then put "hello-from-oxt" into tText
-   write oscBuildMessage("/monitor/echo", [["s", tText]]) to socket ("127.0.0.1:" & sMonPort)
+   -- Build the OSC args array by assignment -- xTalk has no [...] list literal.
+   put "s" into tPair[1]
+   put tText into tPair[2]
+   put tPair into tArgs[1]
+   write oscBuildMessage("/monitor/echo", tArgs) to socket ("127.0.0.1:" & sMonPort)
 end scSendOsc
 
 -- ===== inbound (one datagram socket for both protocols) ====================
 
-on scMonArrived pData, pSender
-   if (byte 1 to 7 of pData) is "Art-Net" then
-      local tDmx
-      put artnetParseDmx(pData) into tDmx
+on scMonArrived pA, pB
+   -- The datagram callback's parameter order is engine-dependent; pick whichever
+   -- parameter looks like a packet (the other is the socket id).
+   local tData, tDmx, tMsg
+   if scLooksLikePacket(pA) then
+      put pA into tData
+   else
+      put pB into tData
+   end if
+   if (the number of bytes in tData) >= 7 and (byte 1 to 7 of tData) is "Art-Net" then
+      put artnetParseDmx(tData) into tDmx
       if tDmx["opcode"] is "ArtDmx" then
          scRenderDmx tDmx["channels"]
       end if
    else
-      local tMsg
-      put oscParse(pData) into tMsg
+      put oscParse(tData) into tMsg
       if tMsg["address"] is "/monitor/echo" then
          scLog "OSC echo received: " & (tMsg["args"][1])
       end if
    end if
-   read from socket pSender for 65535
+   -- accepted datagram connections keep delivering; no re-read needed.
 end scMonArrived
+
+private function scLooksLikePacket pX
+   if (the number of bytes in pX) < 1 then
+      return false
+   end if
+   if (char 1 of pX) is "/" then
+      return true
+   end if
+   if (the number of bytes in pX) >= 7 then
+      if (byte 1 to 7 of pX) is "Art-Net" then
+         return true
+      end if
+      if (byte 1 to 7 of pX) is "#bundle" then
+         return true
+      end if
+   end if
+   return false
+end scLooksLikePacket
 
 -- ===== util ================================================================
 

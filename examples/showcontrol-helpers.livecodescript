@@ -58,7 +58,25 @@ end scMidiPollAndDispatch
 
 -- ===== OSC convenience =====================================================
 
--- Send one OSC message to host:port. pArgs is a list of [type, value] pairs.
+-- Build an OSC args list the way LiveCode Script must. xTalk has NO [...]
+-- list-literal expression (that is LiveCode Builder syntax), so you cannot write
+-- oscBuildMessage("/x", [["i", 60]]) in a .livecodescript. Instead build the args
+-- array by assignment: scAddArg appends one [type, value] pair to an args array
+-- passed BY REFERENCE, and you hand the finished array to oscBuildMessage / scOscSend.
+-- For the no-value OSC types (T/F/N/I) pass empty for the value -- it is ignored.
+--
+--   local tArgs
+--   scAddArg tArgs, "i", 60
+--   scAddArg tArgs, "f", 0.8
+--   put oscBuildMessage("/synth/note", tArgs) into tData
+command scAddArg @pArgs, pType, pValue
+   local tPair
+   put pType into tPair[1]
+   put pValue into tPair[2]
+   put tPair into pArgs[(the number of elements of pArgs) + 1]
+end scAddArg
+
+-- Send one OSC message to host:port. pArgs is an args array built with scAddArg.
 on scOscSend pHost, pPort, pAddress, pArgs
    local tData
    put oscBuildMessage(pAddress, pArgs) into tData

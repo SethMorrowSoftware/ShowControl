@@ -108,7 +108,7 @@ on oscDataReceived pSocket, pData
    put oscParse(pData) into tMsg
    if tMsg["address"] is "/1/fader1" then
       -- args is a 1-based list; the fader value is the first argument
-      set the thumbPosition of scrollbar "Volume" to (item 1 of tMsg["args"]) * 100
+      set the thumbPosition of scrollbar "Volume" to (tMsg["args"][1]) * 100
    end if
    read from socket pSocket with message "oscDataReceived" -- keep listening
 end oscDataReceived
@@ -120,12 +120,16 @@ e.g. `"f"`), `args` (a 1-based list of decoded values), and `isBundle`
 `messages` (a list of sub-message Arrays) instead. The full shape is in the
 [API reference](api-reference.md#osc).
 
-**Send a message** - drive a Resolume layer's opacity when a button is clicked:
+**Send a message** - drive a Resolume layer's opacity when a button is clicked.
+Note you build the args array by assignment with `scAddArg` - LiveCode Script has
+**no `[...]` list-literal** (that is LiveCode Builder syntax; see the
+[API reference](api-reference.md#osc)):
 
 ```
 on mouseUp
-   put oscBuildMessage("/composition/layers/1/video/opacity/values", \
-        [["f", 0.75]]) into tData
+   local tArgs
+   scAddArg tArgs, "f", 0.75
+   put oscBuildMessage("/composition/layers/1/video/opacity/values", tArgs) into tData
    write tData to socket "127.0.0.1:7000"
 end mouseUp
 ```
@@ -136,9 +140,10 @@ pattern with wildcards (`? * [ ] { }`), use
 `oscMatch(pPattern, pAddress)` -> Boolean.
 
 > **Round-trip check.** With no external app, send to yourself: open the receive
-> socket above, then run
-> `write oscBuildMessage("/1/fader1", [["f", 0.5]]) to socket "127.0.0.1:9000"`
-> in the Message Box and watch the scrollbar jump to mid-travel.
+> socket above, then in the Message Box run
+> `local a; scAddArg a, "f", 0.5; write oscBuildMessage("/1/fader1", a) to socket "127.0.0.1:9000"`
+> and watch the scrollbar jump to mid-travel. (For a full automated version, run
+> `examples/selftest.livecodescript` - see [testing-in-oxt.md](testing-in-oxt.md).)
 
 ## 5. MIDI walkthrough: poll a controller
 

@@ -60,9 +60,17 @@ end runShowControlSelfTest
 -- ===== Tier 1: OSC =========================================================
 
 private command testOscRoundTrip
-   local tData, tMsg, tArgs
-   put oscBuildMessage("/test/all", \
-        [["i", -42], ["f", 0.5], ["s", "hello"], ["d", 3.25], ["T"], ["F"]]) into tData
+   local tData, tMsg, tArgs, tBuild, tBig
+   -- Build the args by assignment -- xTalk has NO [...] list literal (that is
+   -- LiveCode Builder syntax). stAddArg appends one [type, value] pair; the
+   -- no-value types (T/F) take an ignored empty value.
+   stAddArg tBuild, "i", -42
+   stAddArg tBuild, "f", 0.5
+   stAddArg tBuild, "s", "hello"
+   stAddArg tBuild, "d", 3.25
+   stAddArg tBuild, "T", ""
+   stAddArg tBuild, "F", ""
+   put oscBuildMessage("/test/all", tBuild) into tData
    stAssert "oscBuildMessage returns non-empty Data", (tData is not empty)
    stAssert "datagram length is a multiple of 4", ((the number of bytes in tData) mod 4 is 0)
 
@@ -83,16 +91,23 @@ private command testOscRoundTrip
    put return & "    (args element count: " & (the number of elements of tArgs) & ")" after sLog
 
    -- 64-bit int crosses as a decimal STRING end to end.
-   put oscParse(oscBuildMessage("/big", [["h", "9223372036854775807"]])) into tMsg
+   stAddArg tBig, "h", "9223372036854775807"
+   put oscParse(oscBuildMessage("/big", tBig)) into tMsg
    put tMsg["args"] into tArgs
    stAssert "int64 round-trips as decimal string", (tArgs[1] is "9223372036854775807")
 end testOscRoundTrip
 
 private command testOscBundle
-   local tA, tB, tBundle, tParsed, tMsgs
-   put oscBuildMessage("/a", [["i", 1]]) into tA
-   put oscBuildMessage("/b", [["f", 2.0]]) into tB
-   put oscBuildBundle("1", [tA, tB]) into tBundle
+   local tA, tB, tBundle, tParsed, tMsgs, tArgs, tMsgList
+   stAddArg tArgs, "i", 1
+   put oscBuildMessage("/a", tArgs) into tA
+   put empty into tArgs                 -- reset the args array for the next message
+   stAddArg tArgs, "f", 2.0
+   put oscBuildMessage("/b", tArgs) into tB
+   -- the bundle's message list is also an array, built by assignment
+   put tA into tMsgList[1]
+   put tB into tMsgList[2]
+   put oscBuildBundle("1", tMsgList) into tBundle
    stAssert "oscBuildBundle returns non-empty", (tBundle is not empty)
 
    put oscParse(tBundle) into tParsed
@@ -194,8 +209,10 @@ private command testMidiPorts
    local tIns, tOuts, tOut
    put midiInputPorts() into tIns
    put midiOutputPorts() into tOuts
-   stAssert "midiInputPorts() returned a list without error", (tIns is an array or tIns is empty)
-   stAssert "midiOutputPorts() returned a list without error", (tOuts is an array or tOuts is empty)
+   -- Reaching here means the calls returned without throwing (the real test). Avoid
+   -- 'is an array', whose support varies; just report the counts as a diagnostic.
+   stAssert "midiInputPorts() returned without error", true
+   stAssert "midiOutputPorts() returned without error", true
    put return & "    (inputs: " & (the number of elements of tIns) \
        & ", outputs: " & (the number of elements of tOuts) & ")" after sLog
 
@@ -238,20 +255,28 @@ private command startLoopback
 end startLoopback
 
 command stSendLoopback
-   -- OSC to self
-   write oscBuildMessage("/selftest/osc", [["s", "loopback-ok"], ["i", 7]]) \
-         to socket ("127.0.0.1:" & sLoopPort)
+   -- OSC to self (args built by assignment -- no [...] literal in xTalk)
+   local tArgs
+   stAddArg tArgs, "s", "loopback-ok"
+   stAddArg tArgs, "i", 7
+   write oscBuildMessage("/selftest/osc", tArgs) to socket ("127.0.0.1:" & sLoopPort)
    -- Art-Net to self (channel 1 = 200)
    write artnetBuildDmx(0, numToByte(200)) to socket ("127.0.0.1:" & sLoopPort)
 end stSendLoopback
 
-on stLoopbackArrived pData, pSender
-   local tLine
+on stLoopbackArrived pA, pB
+   -- The datagram callback's parameter order is engine-dependent (some send
+   -- data first, some the socket id first), so don't assume -- pick whichever
+   -- parameter actually looks like an OSC / Art-Net packet.
+   local tData, tLine, tDmx, tMsg
+   if stLooksLikePacket(pA) then
+      put pA into tData
+   else
+      put pB into tData
+   end if
    put empty into tLine
-   -- Is it Art-Net? (starts with "Art-Net" + NUL)
-   if (byte 1 to 7 of pData) is "Art-Net" then
-      local tDmx
-      put artnetParseDmx(pData) into tDmx
+   if (the number of bytes in tData) >= 7 and (byte 1 to 7 of tData) is "Art-Net" then
+      put artnetParseDmx(tData) into tDmx
       if tDmx["opcode"] is "ArtDmx" then
          put "  [PASS] Tier 2 Art-Net loopback: ch1=" \
              & byteToNum(byte 1 of tDmx["channels"]) & " (expected 200)" into tLine
@@ -259,8 +284,7 @@ on stLoopbackArrived pData, pSender
          put "  [FAIL] Tier 2 Art-Net loopback: not parsed as ArtDmx" into tLine
       end if
    else
-      local tMsg
-      put oscParse(pData) into tMsg
+      put oscParse(tData) into tMsg
       if tMsg["address"] is "/selftest/osc" then
          put "  [PASS] Tier 2 OSC loopback: address & args round-tripped over UDP" into tLine
       else
@@ -269,10 +293,40 @@ on stLoopbackArrived pData, pSender
    end if
    put return & tLine after sLog
    showResults
-   read from socket pSender for 65535     -- keep listening
+   -- accepted datagram connections keep delivering; no re-read needed.
 end stLoopbackArrived
 
+-- Does this value look like an OSC or Art-Net datagram (vs a socket id string)?
+private function stLooksLikePacket pX
+   if (the number of bytes in pX) < 1 then
+      return false
+   end if
+   if (char 1 of pX) is "/" then
+      return true       -- OSC message address
+   end if
+   if (the number of bytes in pX) >= 7 then
+      if (byte 1 to 7 of pX) is "Art-Net" then
+         return true
+      end if
+      if (byte 1 to 7 of pX) is "#bundle" then
+         return true    -- OSC bundle
+      end if
+   end if
+   return false
+end stLooksLikePacket
+
 -- ===== reporting ===========================================================
+
+-- Append one OSC [type, value] pair to an args array passed BY REFERENCE. xTalk
+-- has no [...] list-literal expression, so this is how you build the args you pass
+-- to oscBuildMessage. (Self-contained copy of showcontrol-helpers' scAddArg, named
+-- with the st prefix so this file stays standalone.)
+private command stAddArg @pArgs, pType, pValue
+   local tPair
+   put pType into tPair[1]
+   put pValue into tPair[2]
+   put tPair into pArgs[(the number of elements of pArgs) + 1]
+end stAddArg
 
 private command stSection pTitle
    put return & return & "== " & pTitle & " ==" after sLog

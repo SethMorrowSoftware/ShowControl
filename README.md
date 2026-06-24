@@ -175,14 +175,16 @@ ship as LiveCode Script in
 on socketReceived pData, pHost
    put oscParse(pData) into tMsg
    if tMsg["address"] is "/1/fader1" then
-      set the thumbPosition of scrollbar "Volume" to (item 1 of tMsg["args"]) * 100
+      set the thumbPosition of scrollbar "Volume" to (tMsg["args"][1]) * 100
    end if
    read from socket pHost for 8192
 end socketReceived
 
 on mouseUp
-   write oscBuildMessage("/composition/layers/1/video/opacity/values", \
-        [["f", 0.75]]) to socket "127.0.0.1:7000"
+   local tArgs                          -- build args by assignment: xTalk has no [...] literal
+   scAddArg tArgs, "f", 0.75
+   write oscBuildMessage("/composition/layers/1/video/opacity/values", tArgs) \
+        to socket "127.0.0.1:7000"
 end mouseUp
 ```
 
