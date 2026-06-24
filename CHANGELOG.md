@@ -66,6 +66,10 @@ exists) surfaced LiveCode Builder syntax issues the static checker didn't cover:
 - **`div` is LiveCode Script only** - LCB has no integer-division operator (the
   compiler accepts `mod` but rejects `div`). Replaced every `div` with an `intDiv`
   helper (floor division via `a - (a mod b)`): artnet x6, midi x2.
+- **`numToByte`/`byteToNum` are LiveCode Script names** - LCB spells them
+  `the byte with code <n>` and `the code of <byte>` (`com.livecode.byte`). Replaced
+  all 65 uses. The ArtPollReply IP string additionally needed each octet
+  `formatted as string` before `&`, since LCB's `&` concatenates Strings only.
 
 ### OSC (`osc`, ABI 1)
 - C shim `src/osc/osc_shim.c` over vendored tinyosc (ISC): a non-variadic
