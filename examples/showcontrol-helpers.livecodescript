@@ -73,7 +73,21 @@ end scMidiPollAndDispatch
 --   put oscBuildMessage("/synth/note", tArgs) into tData
 command scAddArg @pArgs, pType, pValue
    put pType into pArgs[(the number of elements of pArgs) + 1]
-   put pValue into pArgs[(the number of elements of pArgs) + 1]
+   if pType is "b" then
+      -- Blob: raw Data must cross unchanged (oscBuildMessage reads it as Data).
+      put pValue into pArgs[(the number of elements of pArgs) + 1]
+   else
+      -- Force every non-blob value to a STRING before it enters the args list.
+      -- oscBuildMessage's internal addArg takes the value as LCB type `any`, and
+      -- LCB cannot introspect an `any` or convert a Number to a String (there is
+      -- no `is a number`, no try/catch -- see the LCB Language Reference). So a
+      -- value the engine kept as a Number (e.g. the integer 60) would fail inside
+      -- LCB. `& empty` is LiveCode's force-to-string: it collapses the number/
+      -- string duality to a pure string, which arrives in LCB as a String and is
+      -- parsed in C. (Pass floats/doubles you need at full precision as strings --
+      -- a string is preserved verbatim; a number is stringified via numberFormat.)
+      put (pValue & empty) into pArgs[(the number of elements of pArgs) + 1]
+   end if
 end scAddArg
 
 -- Send one OSC message to host:port. pArgs is an args array built with scAddArg.

@@ -26,6 +26,20 @@ Real OpenXTalk runs of the OSC build path surfaced issues no static gate could:
   now stringifies every numeric arg and the shim parses it in C (as it already did
   for int64). **A rebuilt osc binary (ABI 2) is required**; `checkABI()` throws a
   clear "rebuild the osc shim" error against an old ABI-1 binary.
+- **The script side must normalize arg types; LCB cannot (no rebuild).** Even with
+  the `_str` entry points, `addArg`'s `put pValue into tStr` still threw `expected
+  type string for tStr` when the engine handed a value across as a `Number` (an
+  integer like `-42`, vs a decimal like `0.5` which arrives as a `String`). LCB has
+  **no runtime type test and no try/catch** (LCB Language Reference), so it cannot
+  branch on, or recover from, an `any` that is sometimes a Number and sometimes a
+  String - the value's type must be fixed *before* it crosses. The `scAddArg` /
+  `stAddArg` helpers now force every non-blob value through `& empty` (LiveCode's
+  canonical force-to-string) so LCB always receives a `String`; the comment in
+  `osc.lcb` that claimed `any -> String` "always succeeds" was the wrong assumption
+  and is corrected. Script-only change - **the osc ABI stays 2, no rebuild needed.**
+- **One nested-array arg site was missed by the flat-list switch** and is now fixed:
+  `loopback-monitor.livecodescript` still built `tArgs[1] = [type, value]`; flattened
+  it to `tArgs[1]=type, tArgs[2]=value` like the other examples.
 - **Builder bug found in the process (now fixed):** `osc_build_finish` did not
   NUL-terminate the type-tag string when `','+tags` was itself a multiple of 4
   (argument count % 4 == 3, i.e. 3/7/11/... args), so the args ran into the tag

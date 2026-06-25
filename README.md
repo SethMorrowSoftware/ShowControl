@@ -131,7 +131,7 @@ built-in commands/functions. Full signatures, the `oscParse` Array shape, and th
 **OSC** — build/parse messages and bundles into `Data`; you own the socket.
 
 ```
-oscBuildMessage(pAddress, pArgs)   -> Data     -- pArgs = list of [type, value] pairs
+oscBuildMessage(pAddress, pArgs)   -> Data     -- pArgs = flat list: type, value, ... (use scAddArg)
 oscBuildBundle(pTimetag, pMessages)-> Data
 oscParse(pData)                    -> Array    -- bounds-checked; handles bundles (incl. nested)
 oscMatch(pPattern, pAddress)       -> Boolean  -- OSC 1.0 wildcards  ? * [ ] { }

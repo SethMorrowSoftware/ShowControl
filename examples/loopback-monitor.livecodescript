@@ -124,10 +124,12 @@ command scSendOsc
    local tText, tPair, tArgs
    put the text of field "scOscIn" into tText
    if tText is empty then put "hello-from-oxt" into tText
-   -- Build the OSC args array by assignment -- xTalk has no [...] list literal.
-   put "s" into tPair[1]
-   put tText into tPair[2]
-   put tPair into tArgs[1]
+   -- Build the OSC args as a FLAT list (type, value, ...) -- xTalk has no [...]
+   -- list literal, and a NESTED array does not survive the Script->LCB boundary
+   -- as a list-of-lists, so the args must be flat scalars. tText is already a
+   -- string (the field's text), which is exactly what type "s" wants.
+   put "s" into tArgs[1]
+   put tText into tArgs[2]
    write oscBuildMessage("/monitor/echo", tArgs) to socket ("127.0.0.1:" & sMonPort)
 end scSendOsc
 
