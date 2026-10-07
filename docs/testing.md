@@ -58,6 +58,15 @@ first real rig ([`testing-in-oxt.md`](testing-in-oxt.md)).
 
 ## Running everything
 
+One command runs every layer in order and prints a summary (the two OXT layers
+are reported NOT RUN, never passed, without an OXT folder):
+
+```sh
+python3 tools/test-all.py --oxt-bin /path/to/oxt/bin        # add --skip-build to reuse ./build
+```
+
+Or layer by layer:
+
 ```sh
 # native shims + the mock MIDI library + the C tests
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON

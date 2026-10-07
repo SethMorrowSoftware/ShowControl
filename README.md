@@ -290,6 +290,10 @@ the engine's sockets, and interop with independent virtual peers. Full guide:
 [`docs/testing.md`](docs/testing.md).
 
 ```sh
+# everything, in order, one summary (~15 s on a warm build)
+python3 tools/test-all.py --oxt-bin /path/to/oxt/bin
+
+# ...or layer by layer:
 # native shims, the mock MIDI library, C tests (smoke, vectors, mock, fuzzer)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON
 cmake --build build --config Release
