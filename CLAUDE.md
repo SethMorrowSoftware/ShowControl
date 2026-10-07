@@ -36,7 +36,11 @@ The native libraries ship **bundled inside each extension** under
 `src/<ext>/code/<arch>-<platform>/<ext>.{so,dll,dylib}` (bare token, no `lib` prefix;
 platform-ids `x86_64-linux` / `x86-linux` / `x86_64-win32` / `x86-win32` / `universal-mac`,
 **architecture FIRST**, Windows `-win32` for both bitnesses). Those are built and tested by CI
-and attached to each Release; `tools/package-extension.py` refreshes the committed tree from a
+and attached to each Release. They are landed ONLY by `.github/workflows/release-binaries.yml`
+(manual dispatch: portable lanes for all six platform ids, verified by
+`tools/install-release-binaries.py`, then committed) and checked on every push by
+`tools/check-binary-freshness.py` (bind oracle, export closure, ABI decoded from machine
+code, deps, glibc floor, MANIFEST.sha256). `tools/package-extension.py` stages one build into a
 newer build. Installing the packaged extension makes the engine resolve the `c:osc>` / `c:midi>`
 bindings via `the revLibraryMapping` automatically. **Art-Net carries no binary** and is exempt
 from the build matrix and macOS notarization.
@@ -169,7 +173,14 @@ deliberate future item, behind the same script API.
 12. **The mock midi library must never ship.** It is built as `build/mock/midi.*`
     with the same bare name; build.yml's staging excludes `*/mock/*` and
     `tools/package-extension.py` refuses any binary exporting `midimock_*`.
-13. **ABI versions:** osc is `2`, midi is `2`. Bump with `checkABI()` together.
+13. **ABI versions:** osc is `2`, midi is `2`. Bump with `checkABI()` together -- and then
+    dispatch `release-binaries.yml`: the freshness gate fails until every committed binary
+    carries the new ABI (it decodes `<ext>_abi_version()` from each slice's machine code).
+14. **Shipped binaries must be portable and closed:** `src/<ext>/<ext>.map` (ELF version
+    script; macOS derives its export list from it) exports only `<ext>_*`; RtMidi's
+    unconditional `RTMIDI_EXPORT` is stripped in CMake; `SHOWCONTROL_STATIC_RUNTIME` (default
+    ON) gives the static MSVC CRT and static libstdc++/libgcc on Linux. The freshness gate
+    enforces all of it.
 
 ## LiveCodeScript / LCB / OXT gotchas (each observed on a real engine)
 

@@ -96,18 +96,25 @@ ShowControl/
 │   ├── gen_vectors.py            vectors -> vectors.h / the LCB vectors module / a fuzz corpus
 │   ├── sim/                      virtual Art-Net node + OSC peer (clean-room codecs)
 │   ├── check-livecodescript.py   static gate for .lcb + .livecodescript
-│   └── package-extension.py      refresh the committed code/<plat>/ trees
+│   ├── package-extension.py      stage a build into code/<plat>/, keep MANIFEST.sha256
+│   ├── install-release-binaries.py   verify + land a CI bundle (the release workflow uses it)
+│   ├── check-binary-freshness.py the committed binaries: current, closed, portable?
+│   └── binfmt.py                 ELF / PE / Mach-O reader those tools share
 ├── examples/                     LiveCode Script helpers + a wired-together demo
 ├── docs/                         architecture, building, getting-started, api-reference,
 │                                 testing, testing-in-oxt, phase0-ffi-spike, project-plan
 ├── CMakeLists.txt                builds the osc + midi native libraries (+ tests, mock, fuzzer)
-└── .github/workflows/            build.yml (shims, ASan/UBSan, release) + test.yml (headless suites)
+└── .github/workflows/            build.yml (fast feedback, ASan/UBSan, release assets), test.yml
+                                  (headless suites), release-binaries.yml (portable builds -> code/)
 ```
 
 The native libraries ship **bundled inside each extension** at
 `src/<ext>/code/<arch>-<platform>/<ext>.{so,dll,dylib}` (bare token name, no `lib`
 prefix; platform-ids `x86_64-linux`, `x86-linux`, `x86_64-win32`, `x86-win32`,
-`universal-mac` — **architecture first**, Windows `-win32` for both bitnesses).
+`arm64-linux`, `universal-mac` — **architecture first**, Windows `-win32` for both bitnesses).
+They are built, verified and committed by [`release-binaries.yml`](.github/workflows/release-binaries.yml)
+(portable: manylinux_2_28 on Linux, the static CRT on Windows, both slices on macOS) and
+checked on every push by `tools/check-binary-freshness.py`.
 Installing the packaged extension makes the engine resolve the `c:osc>` / `c:midi>`
 bindings automatically via `the revLibraryMapping`. **Art-Net carries no binary.**
 

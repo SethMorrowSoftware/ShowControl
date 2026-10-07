@@ -1,0 +1,289 @@
+# release-binaries.yml - build the osc + midi native libraries for EVERY platform,
+# verify them, and land them in src/<ext>/code/<platform-id>/ (the xtalk-suite's
+# release-binaries model, ported).
+#
+# WHY. The committed code/ binaries are what users install, so they must be (a)
+# built from the current source, (b) portable, and (c) verified before they land.
+# Each lane builds + tests natively, stages its libraries with
+# tools/package-extension.py, and runs tools/check-binary-freshness.py on them:
+# bind oracle, export closure, the ABI decoded from machine code, dependencies,
+# the glibc floor. The commit job then runs tools/install-release-binaries.py
+# (the SAME verifier you run by hand) and the whole-tree freshness gate.
+#
+# WHO COMMITS. Only a person: this workflow commits only when someone presses
+# "Run workflow" (workflow_dispatch). On a pull request that touches the shims it
+# builds and verifies every lane and publishes the bundle -- nothing is committed;
+# download the `release-binaries` artifact and run
+# `python3 tools/install-release-binaries.py <dir>` to land it yourself.
+#
+#   commit_mode: branch  commit straight to the branch you dispatched on
+#                pr      push release-binaries/<run> and open a PR
+#                none    just the bundle
+#
+# PORTABILITY, asserted where each artifact is born (by the freshness gate):
+#   * x86_64-linux / arm64-linux build in manylinux_2_28 containers -> glibc
+#     floor 2.28, libstdc++/libgcc static, nothing dynamic but system libraries
+#     (and libasound.so.2 -- the ALSA MIDI service itself).
+#   * x86-linux builds -m32 on a stock runner (floor reported, not enforced).
+#   * Windows uses the static CRT -- no VC++ redistributable needed.
+#   * universal-mac MUST carry arm64 AND x86_64 (a thin dylib is refused); the
+#     x86_64 slice is EXECUTED under Rosetta, not just linked.
+name: release binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_mode:
+        description: "How to land the built binaries"
+        type: choice
+        options: [branch, pr, none]
+        default: branch
+      platforms:
+        description: "Platform ids to install, space-separated, or 'all'"
+        type: string
+        default: all
+  pull_request:
+    paths:
+      - "src/osc/**"
+      - "src/midi/**"
+      - "src/third_party/**"
+      - "CMakeLists.txt"
+      - "tools/package-extension.py"
+      - "tools/install-release-binaries.py"
+      - "tools/check-binary-freshness.py"
+      - "tools/binfmt.py"
+      - ".github/workflows/release-binaries.yml"
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default; only the commit job raises its own token.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.platform_id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform_id: x86_64-linux
+            os: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            manylinux: "1"
+            suffix: .so
+          - platform_id: arm64-linux
+            os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            manylinux: "1"
+            suffix: .so
+          - platform_id: x86-linux
+            os: ubuntu-24.04
+            suffix: .so
+            m32: "1"
+            cmake_args: >-
+              -DCMAKE_C_FLAGS=-m32 -DCMAKE_CXX_FLAGS=-m32
+              -DCMAKE_LIBRARY_ARCHITECTURE=i386-linux-gnu
+              -DALSA_LIBRARY=/usr/lib/i386-linux-gnu/libasound.so
+              -DALSA_INCLUDE_DIR=/usr/include
+          - platform_id: x86_64-win32
+            os: windows-2025
+            suffix: .dll
+            cmake_args: -A x64
+          - platform_id: x86-win32
+            os: windows-2025
+            suffix: .dll
+            cmake_args: -A Win32
+          - platform_id: universal-mac
+            os: macos-15
+            suffix: .dylib
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        if: ${{ !matrix.container }}
+        with:
+          python-version: "3.12"
+
+      # The manylinux image supplies the old-glibc toolchain and CPython under
+      # /opt/python; cmake + ninja come from pip, ALSA headers from dnf.
+      - name: Provision (manylinux lanes)
+        if: matrix.manylinux
+        run: |
+          set -euo pipefail
+          PYBIN=/opt/python/cp312-cp312/bin
+          "$PYBIN/python3" -m pip install --quiet cmake ninja
+          for t in python3 cmake ctest ninja; do ln -sf "$PYBIN/$t" /usr/local/bin/$t; done
+          ln -sf "$PYBIN/python3" /usr/local/bin/python
+          dnf -y install alsa-lib-devel >/dev/null
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Provision (Linux, stock runner)
+        if: ${{ !matrix.container && runner.os == 'Linux' && !matrix.m32 }}
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      # Two apt calls on purpose (the xtalk-suite's lesson): the -m32 toolchain,
+      # then the i386 libraries, so a resolver conflict cannot take both down.
+      - name: Provision (x86-linux, -m32)
+        if: matrix.m32
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-multilib gcc-multilib
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev:i386
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+
+      # --no-tests=error: an empty test set must never read as green.
+      - name: Test (native slice)
+        run: ctest --test-dir build --build-config Release --output-on-failure --no-tests=error
+
+      # The x86_64 slice EXECUTED under Rosetta: each registered test command is
+      # wrapped in `arch -x86_64` directly (wrapping ctest would not reach it).
+      - name: Test the x86_64 slice under Rosetta (mac)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+          ctest --test-dir build --show-only=json-v1 > /tmp/ctest.json
+          python3 - <<'PYEOF'
+          import json, subprocess, sys
+          tests = json.load(open("/tmp/ctest.json"))["tests"]
+          if not tests:
+              sys.exit("no tests registered - nothing proves the x86_64 slice")
+          for t in tests:
+              cmd = t.get("command")
+              if cmd:
+                  print("x86_64:", t["name"], flush=True)
+                  subprocess.run(["arch", "-x86_64"] + cmd, check=True)
+          print("x86_64 slice: %d test(s) passed under Rosetta" % len(tests))
+          PYEOF
+
+      - name: Stage into src/<ext>/code/${{ matrix.platform_id }}/
+        run: python tools/package-extension.py --platform-id ${{ matrix.platform_id }} --build-dir build
+
+      # The artifact's contract, checked where it is born: format + architecture
+      # for its directory, every bind exported and nothing else, the decoded ABI,
+      # dependencies, the glibc floor -- and, where this runner can, loaded and
+      # called.
+      - name: Verify (binary freshness)
+        run: |
+          set -euo pipefail
+          for ext in osc midi; do
+            echo "== $ext"
+            python tools/check-binary-freshness.py --ext $ext --platform-id ${{ matrix.platform_id }} \
+              --lib src/$ext/code/${{ matrix.platform_id }}/$ext${{ matrix.suffix }}
+          done
+
+      - name: Lay out the bundle slice
+        run: |
+          for ext in osc midi; do
+            mkdir -p bundle/$ext/${{ matrix.platform_id }}
+            cp src/$ext/code/${{ matrix.platform_id }}/$ext${{ matrix.suffix }} bundle/$ext/${{ matrix.platform_id }}/
+          done
+          find bundle -type f
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform_id }}
+          path: bundle/
+          if-no-files-found: error
+
+  bundle:
+    name: collect one bundle
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          path: bundle
+          merge-multiple: true
+      - run: find bundle -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: bundle/
+          if-no-files-found: error
+
+  commit:
+    name: install into the extensions and commit
+    needs: bundle
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.commit_mode != 'none'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: ${{ runner.temp }}/bundle
+      - name: Keep only the platforms this run installs
+        if: github.event.inputs.platforms != '' && github.event.inputs.platforms != 'all'
+        env:
+          PLATFORMS: ${{ github.event.inputs.platforms }}
+        run: |
+          for d in "$RUNNER_TEMP"/bundle/*/*/; do
+            p=$(basename "$d")
+            case " $PLATFORMS " in *" $p "*) echo "install $d" ;; *) rm -rf "$d" ;; esac
+          done
+      - name: Verify, then install (the same tool you run by hand)
+        run: python tools/install-release-binaries.py "$RUNNER_TEMP/bundle" | tee "$RUNNER_TEMP/verdicts.txt"
+      - name: Whole-tree freshness gate
+        run: python tools/check-binary-freshness.py
+      - name: Commit
+        id: commit
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/osc/code src/midi/code
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"; echo "Every committed binary already matched."; exit 0
+          fi
+          stray=$(git diff --cached --name-only | grep -Ev '^src/(osc|midi)/code/' || true)
+          if [ -n "$stray" ]; then echo "::error::refusing to commit paths outside code/: $stray"; exit 1; fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          verdicts=$(grep -E '\((new|unchanged|REPLACES the committed one)\)$' "$RUNNER_TEMP/verdicts.txt" | sed 's/^ *//' || true)
+          git commit -m "Refresh the committed native libraries from a release build" \
+            -m "Built by .github/workflows/release-binaries.yml run ${{ github.run_id }} from ${{ github.sha }}; every library verified by tools/install-release-binaries.py and the whole tree by tools/check-binary-freshness.py." \
+            -m "$verdicts"
+      - name: Push to ${{ github.ref_name }}
+        if: steps.commit.outputs.changed == 'true' && github.event.inputs.commit_mode == 'branch'
+        run: |
+          for attempt in 1 2 3; do
+            git push origin "HEAD:${{ github.ref_name }}" && exit 0
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            sleep $((attempt * 3))
+          done
+          exit 1
+      - name: Open a pull request instead
+        if: steps.commit.outputs.changed == 'true' && github.event.inputs.commit_mode == 'pr'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch="release-binaries/${{ github.run_id }}"
+          git push origin "HEAD:$branch"
+          gh pr create --base "${{ github.ref_name }}" --head "$branch" \
+            --title "Refresh the committed native libraries" \
+            --body "Built and verified by release-binaries.yml run ${{ github.run_id }} from ${{ github.sha }}."

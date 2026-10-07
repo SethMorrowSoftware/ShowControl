@@ -1,0 +1,15 @@
+/* midi.map - linker version script for the shipped midi shared library (ELF).
+ *
+ * Export EXACTLY the midi_* C ABI. midi statically links RtMidi -- whose
+ * classes and C API are marked visibility("default") -- and, in a portable
+ * build, libstdc++/libgcc; without this script the .so exported ~160 of
+ * those symbols into the engine process, where another extension bundling
+ * its own RtMidi (or a different C++ runtime) could collide with them.
+ * macOS derives its export list from this file; Windows exports only
+ * MIDI_API. tools/check-binary-freshness.py enforces the closure. */
+{
+  global:
+    midi_*;
+  local:
+    *;
+};

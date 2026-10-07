@@ -66,6 +66,12 @@ jobs:
         run: |
           python tests/checker_fixtures_test.py
           python tools/check-livecodescript.py
+      - name: The binary installer refuses what it must (its own selftest)
+        run: python tools/install-release-binaries.py --selftest
+      - name: The COMMITTED binaries are fresh, portable and match their manifests
+        run: |
+          python tools/package-extension.py --check
+          python tools/check-binary-freshness.py
 
   fuzz:
     name: libFuzzer osc_parse (ASan + UBSan)
@@ -103,14 +109,20 @@ jobs:
             os: ubuntu-24.04
             asset: linux-x86_64-binaries.tar.xz
             cmake_args: ""
+            pid: x86_64-linux
+            suffix: .so
           - name: windows-x64
             os: windows-2022
             asset: win-x86_64-binaries.zip
             cmake_args: "-A x64"
+            pid: x86_64-win32
+            suffix: .dll
           - name: macos-arm64
             os: macos-15
             asset: mac-universal-binaries.tar.xz
             cmake_args: ""
+            pid: universal-mac
+            suffix: .dylib
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -178,6 +190,19 @@ jobs:
         env:
           SHOWCONTROL_REQUIRE_ALL: "1"
         run: python tools/run-lcs-tests.py --oxt-bin "$OXT_BIN" --build-dir build --min-assertions 120 -v
+
+      # What USERS install is the committed code/<platform-id>/ library, not this
+      # job's fresh build -- so run the suites against those files too (the mock
+      # MIDI library still comes from the build; the real osc + midi from code/).
+      - name: The suites against the COMMITTED binaries (what ships)
+        env:
+          SHOWCONTROL_REQUIRE_ALL: "1"
+        run: |
+          set -euo pipefail
+          osc="src/osc/code/${{ matrix.pid }}/osc${{ matrix.suffix }}"
+          midi="src/midi/code/${{ matrix.pid }}/midi${{ matrix.suffix }}"
+          python tools/run-lcb-tests.py --oxt-bin "$OXT_BIN" --build-dir build --work-dir build/lcb-committed             --osc-lib "$osc" --midi-lib "$midi" --min-assertions 550
+          python tools/run-lcs-tests.py --oxt-bin "$OXT_BIN" --build-dir build --work-dir build/lcs-committed             --osc-lib "$osc" --midi-lib "$midi" --min-assertions 120
 
       - name: Keep the logs
         if: always()
