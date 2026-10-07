@@ -246,7 +246,7 @@ private command startLoopback
    put 9999 into sLoopPort
    -- (Re)open a datagram listener and fire one OSC + one Art-Net packet at it.
    try
-      close socket ("0.0.0.0:" & sLoopPort)
+      close socket sLoopPort   -- an accepted socket is named by its port alone
    end try
    accept datagram connections on port sLoopPort with message "stLoopbackArrived"
    send "stSendLoopback" to me in 200 milliseconds
@@ -255,8 +255,13 @@ private command startLoopback
 end startLoopback
 
 command stSendLoopback
-   -- OSC to self (args built by assignment -- no [...] literal in xTalk)
+   -- OSC to self (args built by assignment -- no [...] literal in xTalk).
+   -- The engine only writes to an OPEN socket (an unopened "host:port" name is
+   -- "socket is not open" and nothing is sent), so open it first.
    local tArgs
+   if ("127.0.0.1:" & sLoopPort) is not among the lines of the openSockets then
+      open datagram socket to ("127.0.0.1:" & sLoopPort)
+   end if
    stAddArg tArgs, "s", "loopback-ok"
    stAddArg tArgs, "i", 7
    write oscBuildMessage("/selftest/osc", tArgs) to socket ("127.0.0.1:" & sLoopPort)

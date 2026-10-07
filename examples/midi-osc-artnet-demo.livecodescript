@@ -90,7 +90,10 @@ end forwardMaster
 
 -- ===== inbound OSC =========================================================
 
-on scOscDatagram pData, pSender
+-- A datagram message arrives as (sender "host:port", data, socket) -- in that
+-- order (engine opensslsocket.cpp readsome). Every datagram is its own message,
+-- so there is nothing to re-read.
+on scOscDatagram pSender, pData
    local tMsg
    put oscParse(pData) into tMsg
    if tMsg["address"] is "/master/level" then
@@ -99,7 +102,6 @@ on scOscDatagram pData, pSender
       put tMsg["args"] into tArgs
       set the thumbPosition of scrollbar "Master" to round((tArgs[1]) * 127)
    end if
-   read from socket pSender for 65535
 end scOscDatagram
 
 -- ===== tiny logger =========================================================
