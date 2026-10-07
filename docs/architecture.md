@@ -345,10 +345,12 @@ Exposing more of tinyosc / RtMidi is mechanical:
    64-bit value as a decimal string. Declare it in the matching `*_shim.h`.
 2. **LCB library** (`src/<ext>/<ext>.lcb`) - add a matching
    `private foreign handler ... binds to "c:<ext>><ext>_yourthing!cdecl"`, then a
-   `public handler ...` wrapper that pre-sizes any out `Data`, bridges types per the
-   table above, hides the handle, sets the module last-error on failure
-   (so `oscLastError`/`midiLastError` report it), and returns empty/`0` rather
-   than throwing across the boundary.
+   `public handler ...` wrapper that passes byte buffers through the
+   `MCDataGetBytePtr` / scratch-block helpers (never a `Data` straight into a
+   `Pointer`, never a returned `ZString*`), bridges types per the table above,
+   hides the handle, and returns empty/`0` rather than throwing across the
+   boundary. Add a `tests/lcb` test that calls the new public handler -- the
+   headless suite is the only thing that proves the marshalling.
 3. **Script helper** (`examples/showcontrol-helpers.livecodescript`, optional) - add
    sugar only if it earns its place (e.g. a new dispatch case in the MIDI loop).
 4. **Bump `OSC_ABI_VERSION` / `MIDI_ABI_VERSION`** in the shim if the exported ABI
