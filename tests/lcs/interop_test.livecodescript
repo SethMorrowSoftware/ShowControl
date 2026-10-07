@@ -24,6 +24,16 @@ on peerReplied pSender, pData, pSocket
    put TestHex(pData) & return after sReplies
 end peerReplied
 
+-- Replies to an OPENED datagram socket: open it plainly (synchronously), then
+-- `read from socket ... with message` -- for a datagram socket that registers the
+-- per-datagram message (engine opensslsocket.cpp MCS_read_socket). NOT
+-- `open datagram socket ... with message`: there the message is the asynchronous
+-- open-complete callback, and an immediate write races the name resolution.
+command scOpenForReplies pHostPort
+   open datagram socket to pHostPort
+   read from socket pHostPort with message "peerReplied"
+end scOpenForReplies
+
 function replyCount
    if sReplies is empty then
       return empty
@@ -36,8 +46,7 @@ end replyCount
 on TestOscPeerReadsWhatWeSend
    local tPeer, tArgs, tAck
    put "127.0.0.1:" & $SC_OSC_PEER_PORT into tPeer
-   -- replies to an OPENED datagram socket come back on it, as its message
-   open datagram socket to tPeer with message "peerReplied"
+   scOpenForReplies tPeer
    scAddArg tArgs, "i", -42
    scAddArg tArgs, "f", 0.5
    scAddArg tArgs, "s", "interop"
@@ -64,7 +73,7 @@ end TestOscPeerReadsWhatWeSend
 on TestOscPeerReadsOurBundles
    local tPeer, tArgs, tMsgs, tAck
    put "127.0.0.1:" & $SC_OSC_PEER_PORT into tPeer
-   open datagram socket to tPeer with message "peerReplied"
+   scOpenForReplies tPeer
    scAddArg tArgs, "i", 1
    put oscBuildMessage("/a", tArgs) into tMsgs[1]
    put oscBuildMessage("/b", tArgs) into tMsgs[2]
@@ -83,7 +92,7 @@ end TestOscPeerReadsOurBundles
 on TestArtnetNodeDiscoveryAndDmx
    local tNode, tReply, tEcho
    put "127.0.0.1:" & $SC_ARTNET_PEER_PORT into tNode
-   open datagram socket to tNode with message "peerReplied"
+   scOpenForReplies tNode
    write artnetBuildPoll() to socket tNode
    TestAssert "the node answered ArtPoll", TestWaitFor(the long id of me, "replyCount", 3000)
    put artnetParseReply(TestUnhex(line 1 of sReplies)) into tReply

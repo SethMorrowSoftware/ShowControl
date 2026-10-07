@@ -322,6 +322,13 @@ end stLooksLikePacket
 
 -- ===== reporting ===========================================================
 
+-- The full log so far, INCLUDING Tier 2 lines that arrived asynchronously after
+-- runShowControlSelfTest returned (an automated harness reads it after pumping
+-- events; tests/lcs/udp_test does).
+function stLog
+   return sLog
+end stLog
+
 -- Append one OSC type/value pair as TWO consecutive elements (a FLAT list -- a
 -- nested LiveCode array does not survive Script->LCB as a list-of-lists, so the
 -- args are flattened to scalars) to an args array passed BY REFERENCE. xTalk has

@@ -48,8 +48,10 @@ on TestDatagramCallbackContract
    open datagram socket to ("127.0.0.1:" & tPort)
    write tPkt to socket ("127.0.0.1:" & tPort)
    TestAssert "a datagram arrived", TestWaitFor(the long id of me, "udpCount", 3000)
+   set the itemDelimiter to tab
    TestAssert "param 1 is the sender host:port", item 1 of line 1 of sDatagrams contains "127.0.0.1:"
    TestAssertEqual "param 2 is the data, intact", item 2 of line 1 of sDatagrams, TestHex(tPkt)
+   set the itemDelimiter to comma
    close socket tPort
    close socket ("127.0.0.1:" & tPort)
 end TestDatagramCallbackContract
@@ -95,12 +97,14 @@ on TestArtnetFramesOverUdp
    TestPump 300
    TestAssertEqual "ten ArtDmx frames arrived", the number of lines of sDatagrams, 10
    put true into tOk
+   set the itemDelimiter to tab
    repeat for each line tLine in sDatagrams
       put artnetParseDmx(TestUnhex(item 2 of tLine)) into tP
       if tP["opcode"] is not "ArtDmx" or byteToNum(byte 1 of tP["channels"]) is not tP["universe"] * 20 then
          put false into tOk
       end if
    end repeat
+   set the itemDelimiter to comma
    TestAssert "every frame parses with its own universe and levels", tOk
    close socket tPort
    close socket ("127.0.0.1:" & tPort)
@@ -117,9 +121,7 @@ on TestShippedSelfTestTier2
    TestLoadScriptAsLibrary tPath, "ShowControlSelfTest"
    put runShowControlSelfTest() into tLog
    TestPump 1500
-   try
-      put the text of field "STResults" of this card of stack "ShowControlLcsRunner" into tLog
-   end try
+   put stLog() into tLog          -- the log INCLUDING the async Tier 2 lines
    TestDiagnostic tLog
    TestAssert "Tier 2 OSC loopback reported PASS", tLog contains "[PASS] Tier 2 OSC loopback"
    TestAssert "Tier 2 Art-Net loopback reported PASS", tLog contains "[PASS] Tier 2 Art-Net loopback"
