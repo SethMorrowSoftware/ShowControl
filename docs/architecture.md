@@ -177,22 +177,26 @@ model: only MIDI input latency scales with a cadence we control.
 ## The two inbound patterns
 
 **Sockets (OSC, Art-Net) - the engine pushes.** You open an ordinary datagram
-socket and write returned `Data` to it; inbound datagrams arrive in
-`socketReceived`, where you call `oscParse` / `artnetParseDmx`. The extension is a
-pure codec; LiveCode owns the socket and the run loop.
+socket and write returned `Data` to it; inbound datagrams arrive as a message,
+where you call `oscParse` / `artnetParseDmx`. The extension is a pure codec;
+LiveCode owns the socket and the run loop. (Contract verified in the engine source
+and pinned by `tests/lcs/udp_test`: one message per datagram, sender first, no
+`read`; and only an OPEN socket can be written to.)
 
 ```
-   open datagram socket ":9000"
-   on socketReceived pData, pHost
+   accept datagram connections on port 9000 with message "oscArrived"
+   on oscArrived pSender, pData
       put oscParse(pData) into tMsg -- bytes -> Array
       ...
-      read from socket pHost for 8192 -- keep reading
-   end socketReceived
+   end oscArrived
+
+   open datagram socket to "127.0.0.1:7000"     -- once, before any write
+   write oscBuildMessage("/x", tArgs) to socket "127.0.0.1:7000"
 ```
 
 **Polling (MIDI) - you pull on a timer.** RtMidi buffers and delta-time-stamps
 every inbound message in its internal FIFO. The LCB `midiPoll(pHandle)` makes one
-`midi_in_drain` call, walks the batched records, decodes each, and returns a list
+`midi_in_drain_bytes` call, walks the batched records, decodes each, and returns a list
 of event records. A script timer loop calls `midiPoll` and dispatches; ShowControl
 ships that loop as the **poll dispatcher** in
 `examples/showcontrol-helpers.livecodescript`, so users write only event handlers:
@@ -268,26 +272,31 @@ are the conventions every ShowControl binding follows.
 | real number | `CDouble` | `double` | xTalk numbers are doubles |
 | integer / handle | `CInt` | `int32_t` | handles are positive; `0` = invalid |
 | boolean | `CInt` | `int` `0`/`1` | e.g. `midiIgnoreTypes` flags |
-| byte buffer (datagram, blob, MIDI bytes, DMX) | `Data` | `Pointer` + `CInt` length | see below |
-| short string (address, type tag, port name, error) | `String` | `ZStringUTF8` | never the LCB `string` type |
+| byte buffer (datagram, blob, MIDI bytes, DMX) | `Data` | `Pointer` (via `MCDataGetBytePtr` / `MCMemoryAllocate`) + `CInt` length | see below |
+| short string (address, type tag, port name, error) | `String` | in: `ZStringUTF8`; out: caller buffer | never return a `ZString*` |
 | **int64 / uint64 / timetag** | `String` | **decimal `ZStringUTF8`** | the engine has no 64-bit foreign int |
 
-**Byte buffers cross as a (pointer, length) pair.** On the script side a
-datagram, an OSC blob, a MIDI message, or a DMX frame is LiveCode **`Data`**. An
-LCB `Data` bridges to a pointer to its first byte, so an **in** buffer passes that
-pointer plus a `CInt` length to the shim (`osc_parse(data, len)`,
-`midi_out_send(handle, data, len)`). For an **out** buffer the LCB layer
-**pre-sizes a `Data`** to the needed capacity and passes it as the `Pointer` the
-shim fills; the shim returns the byte count written, or `-needed` if the buffer
-was too small, so the caller can grow it and retry. This is the one detail the
-Phase 0 spike confirmed empirically against the target engine; it is isolated in
-the shim so the LCB API is stable regardless.
+**Byte buffers cross as a (pointer, length) pair** -- but a `Data` is not a
+pointer. On the script side a datagram, an OSC blob, a MIDI message, or a DMX frame
+is LiveCode **`Data`**, and LCB has **no automatic bridging from `Data` to a foreign
+`Pointer`** (a `Data` marshals as an `MCDataRef`; passing one throws "Value is not
+of correct type"). So the bindings use the engine's own `<builtin>` helpers: an
+**in** buffer passes `MCDataGetBytePtr(theData)` plus a `CInt` length to the shim
+(`osc_parse(data, len)`, `midi_out_send(handle, data, len)`); an **out** buffer is a
+reusable raw block from `MCMemoryAllocate`, which the shim fills and reports as the
+byte count written (or `-needed` -- grow and retry), copied back into a `Data` with
+`MCDataCreateWithBytes`. This was the Phase 0 question; the headless suites answer
+it on every CI run ([phase0-ffi-spike.md](phase0-ffi-spike.md)).
 
-**Short strings cross as `ZStringUTF8`.** OSC addresses and type tags, MIDI port
-names, and the last-error strings cross as UTF-8 zero-terminated strings - never
-the LCB `string` type. The shim either fills a caller buffer
-(`osc_address(h, out, cap)`) or hands back a defined-lifetime pointer the engine
-copies straight into a `ZStringUTF8` (`osc_address_str(h)`, `midi_in_name_str(i)`).
+**Short strings cross through caller buffers too.** OSC addresses and type tags,
+MIDI port names, and the last-error strings come back as UTF-8 written into the
+same kind of raw block (`osc_address(h, out, cap)`, `midi_in_name(i, out, cap)`)
+and decoded with `MCStringDecode`. A foreign handler must **never return** a
+`ZString*`: the engine wraps the returned pointer in a value whose finalizer
+`free()`s it, so a shim-owned string crashes the VM or double-frees. (The
+`osc_address_str` / `midi_in_name_str` accessors still exist for C callers only.)
+Strings going *in* (addresses, numeric args as decimal text) are plain
+`ZStringUTF8` parameters, which is safe: the engine owns that temporary.
 
 **64-bit values cross as decimal strings.** The target xTalk engine (9.6.3) has
 **no 64-bit foreign integer type**, and a script number is a double anyway (only
@@ -336,10 +345,12 @@ Exposing more of tinyosc / RtMidi is mechanical:
    64-bit value as a decimal string. Declare it in the matching `*_shim.h`.
 2. **LCB library** (`src/<ext>/<ext>.lcb`) - add a matching
    `private foreign handler ... binds to "c:<ext>><ext>_yourthing!cdecl"`, then a
-   `public handler ...` wrapper that pre-sizes any out `Data`, bridges types per the
-   table above, hides the handle, sets the module last-error on failure
-   (so `oscLastError`/`midiLastError` report it), and returns empty/`0` rather
-   than throwing across the boundary.
+   `public handler ...` wrapper that passes byte buffers through the
+   `MCDataGetBytePtr` / scratch-block helpers (never a `Data` straight into a
+   `Pointer`, never a returned `ZString*`), bridges types per the table above,
+   hides the handle, and returns empty/`0` rather than throwing across the
+   boundary. Add a `tests/lcb` test that calls the new public handler -- the
+   headless suite is the only thing that proves the marshalling.
 3. **Script helper** (`examples/showcontrol-helpers.livecodescript`, optional) - add
    sugar only if it earns its place (e.g. a new dispatch case in the MIDI loop).
 4. **Bump `OSC_ABI_VERSION` / `MIDI_ABI_VERSION`** in the shim if the exported ABI

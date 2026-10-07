@@ -12,7 +12,14 @@ Conventions:
   * Handles are integers (0 = invalid); a stale handle is a harmless no-op.
   * Channels in the public API are 1-based (1..16). Raw MIDI bytes are 0-based
     on the wire; the convenience senders convert.
-  * MIDI byte buffers are LiveCode `Data`.
+  * MIDI byte buffers are LiveCode `Data`. A Data does NOT auto-bridge to a
+    foreign `Pointer` (it marshals as an MCDataRef), so -- exactly as osc.lcb and
+    the xtalk-suite bindings do -- sends pass MCDataGetBytePtr(theData), and the
+    drain fills a raw engine block (MCMemoryAllocate) whose written bytes are
+    copied back with MCDataCreateWithBytes.
+  * No binding RETURNS a C string: the engine free()s a returned ZString, which
+    crashes on the shim's static name/error buffers. Names and the last error
+    come back through the caller-buffer entry points instead (see shimText).
 
 The foreign handlers bind to the shared library "midi" (built by CMakeLists.txt,
 bundled inside the extension under code/<arch>-<platform>/midi.{so,dll,dylib}).
@@ -32,26 +39,45 @@ metadata version is "0.1.0"
 private foreign handler _abi_version() returns CInt binds to "c:midi>midi_abi_version!cdecl"
 private foreign handler _in_count() returns CInt binds to "c:midi>midi_in_count!cdecl"
 private foreign handler _out_count() returns CInt binds to "c:midi>midi_out_count!cdecl"
-private foreign handler _in_name_z(in pIndex as CInt) returns ZStringUTF8 binds to "c:midi>midi_in_name_str!cdecl"
-private foreign handler _out_name_z(in pIndex as CInt) returns ZStringUTF8 binds to "c:midi>midi_out_name_str!cdecl"
+private foreign handler _in_name(in pIndex as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:midi>midi_in_name!cdecl"
+private foreign handler _out_name(in pIndex as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:midi>midi_out_name!cdecl"
 private foreign handler _in_open(in pIndex as CInt) returns CInt binds to "c:midi>midi_in_open!cdecl"
 private foreign handler _out_open(in pIndex as CInt) returns CInt binds to "c:midi>midi_out_open!cdecl"
 private foreign handler _in_open_virtual(in pName as ZStringUTF8) returns CInt binds to "c:midi>midi_in_open_virtual!cdecl"
 private foreign handler _out_open_virtual(in pName as ZStringUTF8) returns CInt binds to "c:midi>midi_out_open_virtual!cdecl"
 private foreign handler _close(in pH as CInt) returns nothing binds to "c:midi>midi_close!cdecl"
 private foreign handler _in_ignore(in pH as CInt, in pSysex as CInt, in pTime as CInt, in pSense as CInt) returns nothing binds to "c:midi>midi_in_ignore!cdecl"
-private foreign handler _in_drain(in pH as CInt, in pOut as Pointer, in pCap as CInt, in pMax as CInt) returns CInt binds to "c:midi>midi_in_drain!cdecl"
-private foreign handler _out_send(in pH as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:midi>midi_out_send!cdecl"
-private foreign handler _error_z() returns ZStringUTF8 binds to "c:midi>midi_error_str!cdecl"
+-- midi_in_drain_bytes (ABI 2) returns the BYTES written, which is what we need to
+-- copy exactly the drained records back out of the raw block.
+private foreign handler _in_drain_bytes(in pH as CInt, in pOut as Pointer, in pCap as CInt, in pMax as CInt) returns CInt binds to "c:midi>midi_in_drain_bytes!cdecl"
+private foreign handler _out_send(in pH as CInt, in pData as optional Pointer, in pLen as CInt) returns CInt binds to "c:midi>midi_out_send!cdecl"
+private foreign handler _last_error(in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:midi>midi_last_error!cdecl"
 
+-- dlerror() returns libc-owned text: take it as a raw Pointer and COPY it with
+-- MCStringCreateWithCString, never as a ZString the engine would free.
 private foreign handler _dlopen(in pPath as ZStringNative, in pFlags as CInt) returns optional Pointer binds to "c:>dlopen!cdecl"
-private foreign handler _dlerror() returns optional ZStringNative binds to "c:>dlerror!cdecl"
+private foreign handler _dlerror() returns optional Pointer binds to "c:>dlerror!cdecl"
+
+-- Engine <builtin> helpers (libfoundation/foundation.h). A `<builtin>` handler
+-- resolves by its NAME matching the engine symbol, so these carry NO leading `_`.
+private foreign handler MCDataGetBytePtr(in pData as Data) returns Pointer binds to "<builtin>"
+private foreign handler MCMemoryAllocate(in pSize as UIntSize, out rBlock as Pointer) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryDeallocate(in pBlock as Pointer) returns nothing binds to "<builtin>"
+private foreign handler MCDataCreateWithBytes(in pBytes as Pointer, in pCount as CUInt, out rData as Data) returns CBool binds to "<builtin>"
+private foreign handler MCStringDecode(in pData as Data, in pEncoding as CInt, in pIsExternalRep as CBool, out rString as String) returns CBool binds to "<builtin>"
+private foreign handler MCStringCreateWithCString(in pCString as Pointer, out rString as String) returns CBool binds to "<builtin>"
 
 -- =====================================================================
--- Persistent drain buffer (reused every poll -- never rebuilt in the hot path).
+-- Raw buffers (reused -- never rebuilt in the poll hot path).
 -- =====================================================================
-variable sDrain as Data
+-- The drain block: allocated ONCE (kDrainCap bytes) and reused every poll. The
+-- flag guards the first allocation, so an unset Pointer is never passed.
+variable sDrainPtr as Pointer
 variable sDrainReady as Boolean
+-- A small block for names / the last error, grown on demand. Its capacity (0
+-- until the first allocation) doubles as the "is it allocated?" flag.
+variable sTextPtr as Pointer
+variable sTextCap as Integer
 
 -- Must be >= the C shim's largest single drain record: a 2-byte length prefix, a
 -- 65535-byte maximum SysEx payload, and a 4-byte delta = 65541 bytes. A smaller
@@ -70,26 +96,92 @@ private handler intDiv(in pA as Integer, in pB as Integer) returns Integer
 end handler
 
 private handler ensureDrainBuf()
+   variable tOk as Boolean
    if sDrainReady is true then
       return
    end if
-   -- One-time setup (guarded by sDrainReady; never runs in the poll hot path).
-   -- Build a 256-byte zero chunk, then append whole chunks to cover kDrainCap, so
-   -- this costs a few hundred appends rather than one per byte -- cheap no matter
-   -- how Data growth is implemented underneath.
-   variable tChunk as Data
-   put the empty data into tChunk
-   variable i as Integer
-   repeat with i from 1 up to 256
-      put the byte with code (0) after tChunk
-   end repeat
-   variable tBuf as Data
-   put the empty data into tBuf
-   repeat with i from 1 up to (intDiv(kDrainCap, 256) + 1)
-      put tChunk after tBuf
-   end repeat
-   put byte 1 to kDrainCap of tBuf into sDrain
+   put false into tOk
+   unsafe
+      put MCMemoryAllocate(kDrainCap, sDrainPtr) into tOk
+   end unsafe
+   if not tOk then
+      throw "midi: failed to allocate the drain buffer"
+   end if
    put true into sDrainReady
+end handler
+
+private handler ensureTextBuf(in pNeed as Integer)
+   variable tOk as Boolean
+   if sTextCap >= pNeed then
+      return
+   end if
+   if sTextCap > 0 then
+      unsafe
+         MCMemoryDeallocate(sTextPtr)
+      end unsafe
+      put 0 into sTextCap
+   end if
+   put false into tOk
+   unsafe
+      put MCMemoryAllocate(pNeed, sTextPtr) into tOk
+   end unsafe
+   if not tOk then
+      throw "midi: failed to allocate a text buffer"
+   end if
+   put pNeed into sTextCap
+end handler
+
+-- Which caller-buffer string getter shimText calls (literal, declared before use).
+private constant kTxtInName is 1
+private constant kTxtOutName is 2
+private constant kTxtError is 3
+
+-- Fetch one string through the shim's caller-buffer contract: bytes written
+-- (>= 0), or -needed when too small (grow once, retry). Decoded as UTF-8.
+private handler shimText(in pWhich as Integer, in pIndex as Integer) returns String
+   variable tRc as Integer
+   variable tTry as Integer
+   variable tNeed as Integer
+   variable tData as Data
+   variable tStr as String
+   variable tOk as Boolean
+   put 256 into tNeed
+   put the empty string into tStr
+   repeat with tTry from 1 up to 2
+      ensureTextBuf(tNeed)
+      unsafe
+         if pWhich is kTxtInName then
+            put _in_name(pIndex, sTextPtr, sTextCap) into tRc
+         else if pWhich is kTxtOutName then
+            put _out_name(pIndex, sTextPtr, sTextCap) into tRc
+         else
+            put _last_error(sTextPtr, sTextCap) into tRc
+         end if
+      end unsafe
+      if tRc is 0 then
+         return tStr
+      end if
+      if tRc > 0 then
+         unsafe
+            put MCDataCreateWithBytes(sTextPtr, tRc, tData) into tOk
+         end unsafe
+         if not tOk then
+            return the empty string
+         end if
+         unsafe
+            put MCStringDecode(tData, 4, false, tStr) into tOk
+         end unsafe
+         if not tOk then
+            return the empty string
+         end if
+         return tStr
+      end if
+      if -tRc <= sTextCap then
+         return the empty string
+      end if
+      put -tRc into tNeed
+   end repeat
+   return the empty string
 end handler
 
 -- =====================================================================
@@ -108,8 +200,8 @@ private handler checkABI()
    unsafe
       put _abi_version() into tV
    end unsafe
-   if tV is not 1 then
-      throw "midi: incompatible native library (binding needs ABI 1) - update the midi shim"
+   if tV is not 2 then
+      throw "midi: incompatible native library ABI (binding needs ABI 2) - rebuild/repackage the midi shim"
    end if
 end handler
 
@@ -125,13 +217,9 @@ public handler midiInputPorts() returns List
    variable tList as List
    put [] into tList
    variable i as Integer
-   variable tName as String
    if tCount > 0 then
       repeat with i from 0 up to tCount - 1
-         unsafe
-            put _in_name_z(i) into tName
-         end unsafe
-         push tName onto tList
+         push shimText(kTxtInName, i) onto tList
       end repeat
    end if
    return tList
@@ -146,13 +234,9 @@ public handler midiOutputPorts() returns List
    variable tList as List
    put [] into tList
    variable i as Integer
-   variable tName as String
    if tCount > 0 then
       repeat with i from 0 up to tCount - 1
-         unsafe
-            put _out_name_z(i) into tName
-         end unsafe
-         push tName onto tList
+         push shimText(kTxtOutName, i) onto tList
       end repeat
    end if
    return tList
@@ -241,8 +325,13 @@ end handler
 -- Sending: raw + convenience
 -- =====================================================================
 public handler midiSend(in pHandle as Integer, in pBytes as Data)
+   variable tPtr as Pointer
+   if the number of bytes in pBytes is 0 then
+      return                     -- nothing to send (the shim would reject len 0)
+   end if
    unsafe
-      _out_send(pHandle, pBytes, the number of bytes in pBytes)
+      put MCDataGetBytePtr(pBytes) into tPtr
+      _out_send(pHandle, tPtr, the number of bytes in pBytes)
    end unsafe
 end handler
 
@@ -305,40 +394,51 @@ end handler
 --   ["delta": <seconds>, "bytes": <Data>, "kind": "noteOn",
 --    "channel": 1, "data1": 60, "data2": 100]
 public handler midiPoll(in pHandle as Integer) returns List
-   ensureDrainBuf()
-   variable tCount as Integer
-   unsafe
-      put _in_drain(pHandle, sDrain, kDrainCap, 256) into tCount
-   end unsafe
+   variable tBytes as Integer
+   variable tDrain as Data
+   variable tOk as Boolean
    variable tEvents as List
+   variable tPos as Integer
+   variable tLen as Integer
+   variable tMsg as Data
+   variable tDeltaUs as Integer
    put [] into tEvents
-   if tCount <= 0 then
+   ensureDrainBuf()
+   unsafe
+      put _in_drain_bytes(pHandle, sDrainPtr, kDrainCap, 256) into tBytes
+   end unsafe
+   if tBytes <= 0 then
       return tEvents
    end if
-   variable tPos as Integer
-   put 1 into tPos          -- 1-based byte index into sDrain
-   variable k as Integer
-   repeat with k from 1 up to tCount
-      -- [2 bytes len BE]
-      variable tLen as Integer
-      put the code of (byte tPos of sDrain) * 256 + the code of (byte (tPos + 1) of sDrain) into tLen
+   -- Copy exactly the drained bytes out of the raw block (ONE copy per poll, of
+   -- only what was written -- not the whole 64 KB block).
+   unsafe
+      put MCDataCreateWithBytes(sDrainPtr, tBytes, tDrain) into tOk
+   end unsafe
+   if not tOk then
+      return tEvents
+   end if
+   -- Walk the self-delimiting records, never past the bytes the shim wrote:
+   -- [2 bytes len BE][len bytes message][4 bytes delta micros BE]
+   put 1 into tPos          -- 1-based byte index into tDrain
+   repeat while tPos + 5 <= tBytes
+      put the code of (byte tPos of tDrain) * 256 + the code of (byte (tPos + 1) of tDrain) into tLen
       put tPos + 2 into tPos
-      -- [len bytes message]
-      variable tBytes as Data
+      if tPos + tLen + 3 > tBytes then
+         exit repeat        -- truncated record: cannot happen with a well-behaved shim
+      end if
       if tLen > 0 then
-         put byte tPos to (tPos + tLen - 1) of sDrain into tBytes
+         put byte tPos to (tPos + tLen - 1) of tDrain into tMsg
       else
-         put the empty data into tBytes
+         put the empty data into tMsg
       end if
       put tPos + tLen into tPos
-      -- [4 bytes delta micros BE]
-      variable tDeltaUs as Integer
-      put the code of (byte tPos of sDrain) * 16777216 \
-        + the code of (byte (tPos + 1) of sDrain) * 65536 \
-        + the code of (byte (tPos + 2) of sDrain) * 256 \
-        + the code of (byte (tPos + 3) of sDrain) into tDeltaUs
+      put the code of (byte tPos of tDrain) * 16777216 \
+        + the code of (byte (tPos + 1) of tDrain) * 65536 \
+        + the code of (byte (tPos + 2) of tDrain) * 256 \
+        + the code of (byte (tPos + 3) of tDrain) into tDeltaUs
       put tPos + 4 into tPos
-      push decodeEvent(tBytes, tDeltaUs) onto tEvents
+      push decodeEvent(tMsg, tDeltaUs) onto tEvents
    end repeat
    return tEvents
 end handler
@@ -421,11 +521,7 @@ end handler
 -- Diagnostics + loader
 -- =====================================================================
 public handler midiLastError() returns String
-   variable tErr as String
-   unsafe
-      put _error_z() into tErr
-   end unsafe
-   return tErr
+   return shimText(kTxtError, 0)
 end handler
 
 public handler midiLoadNativeLib(in pPath as String) returns Integer
@@ -440,11 +536,19 @@ public handler midiLoadNativeLib(in pPath as String) returns Integer
 end handler
 
 public handler midiLoadNativeLibError() returns String
-   variable tErr as optional String
+   variable tPtr as optional Pointer
+   variable tErr as String
+   variable tOk as Boolean
    unsafe
-      put _dlerror() into tErr
+      put _dlerror() into tPtr
    end unsafe
-   if tErr is nothing then
+   if tPtr is nothing then
+      return ""
+   end if
+   unsafe
+      put MCStringCreateWithCString(tPtr, tErr) into tOk
+   end unsafe
+   if not tOk then
       return ""
    end if
    return tErr

@@ -137,6 +137,7 @@ ready-to-build extension.
 | Platform-id (`<arch>-<platform>`) | osc bundled file | midi bundled file |
 |-----------------------------------|------------------|-------------------|
 | `x86_64-linux` | `src/osc/code/x86_64-linux/osc.so` | `src/midi/code/x86_64-linux/midi.so` |
+| `arm64-linux` | `src/osc/code/arm64-linux/osc.so` | `src/midi/code/arm64-linux/midi.so` |
 | `x86-linux` | `src/osc/code/x86-linux/osc.so` | `src/midi/code/x86-linux/midi.so` |
 | `x86_64-win32` | `src/osc/code/x86_64-win32/osc.dll` | `src/midi/code/x86_64-win32/midi.dll` |
 | `x86-win32` | `src/osc/code/x86-win32/osc.dll` | `src/midi/code/x86-win32/midi.dll` |
@@ -153,32 +154,49 @@ OXT Lite) - **no library download, no renaming, no sudo, no `/usr/lib`, no
 
 ## Refreshing the committed binaries
 
-**CI does this for you.** When the `osc`/`midi` shim sources change on `main` (or on
-a manual `workflow_dispatch`), the `build` workflow's **`package-binaries`** job
-takes the per-platform libraries it just built and tested, drops them into the
-committed `src/<ext>/code/<platform-id>/` slots, and **opens (or updates) a pull
-request** on the branch `ci/refresh-native-binaries`. Review and merge that PR to
-refresh the committed, ready-to-package binaries. It is gated to actual shim-source
-changes (no churn on doc-only pushes) and excludes `code/` from its trigger so
-merging the refresh PR can't loop. (One-time repo setting: *Settings -> Actions ->
-General -> "Allow GitHub Actions to create and approve pull requests."* Note the
-compiled libraries are not byte-reproducible across runs, which is why this is a
-reviewable PR rather than an automatic commit to `main`.)
+The committed `code/` libraries are what every user installs, so they are built,
+verified and landed by one workflow --
+[`.github/workflows/release-binaries.yml`](../.github/workflows/release-binaries.yml),
+the xtalk-suite's model -- and checked on every push by the freshness gate.
 
-**Doing it by hand.** `tools/package-extension.py` is the manual equivalent (and what
-the CI job calls) - point each flag at the matching built library:
+**To refresh:** Actions -> *release binaries* -> *Run workflow* on your branch.
+Every platform builds and tests in its own lane, stages its libraries into
+`src/<ext>/code/<platform-id>/`, and verifies them; the commit job then reruns the
+same verifier over the whole bundle and commits to the branch (`commit_mode:
+branch`), opens a PR (`pr`), or just publishes the bundle (`none`). It commits
+**only** when a person dispatches it -- automatic workflows never commit binaries.
+A pull request that touches the shims runs every lane too (build + verify, no
+commit), so the bundle is always one click away.
+
+| Lane | How | Portability contract (asserted at birth) |
+|---|---|---|
+| `x86_64-linux`, `arm64-linux` | `manylinux_2_28` container | glibc <= 2.28; libstdc++/libgcc static; only system libraries (+ `libasound.so.2`) |
+| `x86-linux` | stock runner, `-m32` | floor reported, not enforced |
+| `x86_64-win32`, `x86-win32` | MSVC, **static CRT** | imports only `KERNEL32` / `WINMM` / `WS2_32` -- no VC++ redistributable |
+| `universal-mac` | `arm64;x86_64`, deployment target 10.13 | BOTH slices required; the x86_64 slice is executed under Rosetta |
+
+Every lane, and the commit job, verifies with the tools below -- the same ones
+you run by hand:
 
 ```sh
-python3 tools/package-extension.py --check                       # list/validate the committed trees
-python3 tools/package-extension.py --osc-linux64 build/osc.so    # refresh one osc target
-python3 tools/package-extension.py --midi-linux64 build/midi.so  # refresh one midi target
+python3 tools/check-binary-freshness.py          # the committed tree: is every library current + portable?
+python3 tools/install-release-binaries.py <dir>  # land a downloaded bundle (commit_mode: none), verified first
+python3 tools/package-extension.py --check       # list the slots, verify each MANIFEST.sha256
+python3 tools/package-extension.py --platform-id x86_64-linux --build-dir build   # stage one build
 ```
 
-Each flag pairs an extension with a platform: `--osc-linux64` / `--osc-linux32` /
-`--osc-win64` / `--osc-win32` / `--osc-mac` and the `--midi-*` equivalents,
-matching the platform-id table above. `--check` lists and validates the committed
-trees without writing anything (it exits non-zero if any slot is empty). There is
-no `artnet` target - it has no binary.
+`check-binary-freshness.py` reads the ELF / PE / Mach-O files directly (no
+toolchain needed) and fails on: a library whose format or architecture does not
+match its directory (a thin dylib under `universal-mac` included); a `binds to
+"c:<ext>>..."` symbol the library does not export (a load failure); any export
+beyond the `<ext>_*` ABI (version scripts / export lists keep RtMidi and the C++
+runtime out of the engine's process); the MOCK midi library; an
+`<ext>_abi_version()` -- **decoded from its machine code**, every slice -- that
+differs from the header (and, where the host can load it, the value it returns
+when called); non-system dependencies or a glibc floor above 2.28; a
+`MANIFEST.sha256` that does not match the tree; an empty platform slot. Each
+`code/` tree's `MANIFEST.sha256` is maintained by `package-extension.py` and the
+installer.
 
 ## Packaging each extension into a .lce
 
@@ -260,24 +278,20 @@ separate gate also builds the C smoke tests under AddressSanitizer +
 UndefinedBehaviorSanitizer + `float-cast-overflow` with `-fno-sanitize-recover=all`,
 so any memory or UB error fails the build rather than only printing.
 
-When the **osc/midi shim sources change on `main`** (or on a manual
-`workflow_dispatch`), the **`package-binaries`** job drops the freshly-built
-per-platform libraries into the committed `src/<ext>/code/<platform-id>/` trees and
-opens/updates a pull request (`ci/refresh-native-binaries`) with the result - so the
-committed binaries stay in step with the source without a manual
-`package-extension.py` run. See
-[Refreshing the committed binaries](#refreshing-the-committed-binaries) for the
-gating and the one repo setting it needs.
+The `build` workflow's builds are fast feedback only -- stock runners give
+non-portable binaries (glibc 2.39, dynamic runtimes), so they are never what
+ships. The committed libraries come from `release-binaries.yml`
+([Refreshing the committed binaries](#refreshing-the-committed-binaries)), and the
+`test` workflow runs the headless suites against those committed files too.
 
 When a GitHub [Release](../../releases) is **published** (or via a manual
-`workflow_dispatch` with a `release_tag`), CI gathers each platform's `osc` and
-`midi` library and attaches them to that release - the canonical source of tested
-binaries for each version. Note: pushing a bare `vX.Y.Z` tag does **not** trigger
+`workflow_dispatch` with a `release_tag`), CI runs the freshness gate on the
+tagged tree and attaches the **committed** `osc` and `midi` libraries (as
+`<ext>-<platform-id>.<suffix>`) plus both manifests -- byte-for-byte the files an
+installed extension carries. Note: pushing a bare `vX.Y.Z` tag does **not** trigger
 a build; publish a Release (or run the dispatch). Run `package-extension.py --check`
-locally to validate the committed `code/` trees before tagging. The matrix
-currently covers `x86_64-linux`, `universal-mac`, `x86_64-win32`, and `x86-win32`;
-**32-bit Linux (`x86-linux`) is not yet built** (tracked in CHANGELOG) - that slot
-stays empty until a job is added. **artnet**, being pure LCB, needs no build matrix
+locally to validate the committed `code/` trees before tagging. The release
+lanes cover all six platform ids. **artnet**, being pure LCB, needs no build matrix
 and produces identical results everywhere; it is validated by its golden-packet
 tests rather than the native CI.
 

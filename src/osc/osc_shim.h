@@ -138,21 +138,26 @@ OSC_API int32_t  osc_arg_int64_str   (int32_t h, int32_t i, char *out, int32_t o
 OSC_API int32_t  osc_bundle_timetag_str(int32_t h, char *out, int32_t out_cap);
 OSC_API void     osc_parse_free(int32_t h);
 
-/* ---- Convenience string accessors for the LCB layer ---------------------
- * These return a pointer to memory with a DEFINED lifetime (the parsed-message
- * model owns it until osc_parse_free; the error string is a module static), so
- * the engine can copy it straight into a ZStringUTF8 -- the proven Box2Dxt
- * dlerror/realpath pattern. They never hand back memory the library may free or
- * reuse unexpectedly. Return "" (never NULL) on a bad handle. */
+/* ---- C-side convenience string accessors (NOT for LCB) ------------------
+ * These return a pointer to memory with a defined lifetime (the parsed-message
+ * model owns it until osc_parse_free; the error/int64 strings are module statics).
+ * That is fine for a C caller, but they MUST NOT be bound from LCB as `returns
+ * ZStringUTF8`: the engine wraps a returned ZString in a foreign value whose
+ * finalizer free()s the pointer (libscript module-foreign.cpp, __cbuffer_finalize).
+ * Freeing a static crashes the engine; freeing a model pointer double-frees it at
+ * osc_parse_free. The headless lc-run suite crashed on exactly this, so the LCB
+ * binding now uses the caller-buffer getters above (osc_address, osc_typetag,
+ * osc_arg_string, osc_arg_int64_str, osc_bundle_timetag_str, osc_last_error), and
+ * tools/check-livecodescript.py refuses any `returns ZString*` binding. These stay
+ * exported only so the ABI surface is unchanged. Return "" (never NULL). */
 OSC_API const char *osc_address_str(int32_t h);
 OSC_API const char *osc_typetag_str(int32_t h);
 OSC_API const char *osc_error_str(void);
-/* An OSC string argument is already NUL-terminated inside the parsed buffer, so
- * it can be handed back as a ZStringUTF8 directly. Returns "" on a type mismatch
- * / bad index (use osc_arg_blob for binary). Valid until osc_parse_free. */
+/* An OSC string argument, pointing inside the parsed buffer. "" on a type
+ * mismatch / bad index (use osc_arg_blob for binary). Valid until osc_parse_free. */
 OSC_API const char *osc_arg_string_z(int32_t h, int32_t i);
-/* 64-bit reads as ZStringUTF8 (decimal), via a per-call static buffer the engine
- * copies immediately. "" on a type mismatch / bad index. */
+/* 64-bit reads (decimal) via a per-call static buffer, valid until the next call.
+ * "" on a type mismatch / bad index. */
 OSC_API const char *osc_arg_int64_z(int32_t h, int32_t i);
 OSC_API const char *osc_bundle_timetag_z(int32_t h);
 

@@ -100,19 +100,30 @@ on openCard
    accept datagram connections on port 9000 with message "oscDatagramArrived"
 end openCard
 
-on oscDatagramArrived pSocket
-   read from socket pSocket with message "oscDataReceived"
-end oscDatagramArrived
-
-on oscDataReceived pSocket, pData
+-- Called once per datagram with (sender "host:port", data). Accepted datagram
+-- sockets keep delivering -- there is nothing to `read`.
+on oscDatagramArrived pSender, pData
    put oscParse(pData) into tMsg
    if tMsg["address"] is "/1/fader1" then
       -- args is a 1-based list; the fader value is the first argument
       set the thumbPosition of scrollbar "Volume" to (tMsg["args"][1]) * 100
    end if
-   read from socket pSocket with message "oscDataReceived" -- keep listening
-end oscDataReceived
+end oscDatagramArrived
 ```
+
+> **How the engine's UDP actually behaves** (read in the engine source and pinned
+> by the CI socket suite, `tests/lcs/udp_test`): an accepted datagram socket
+> calls your message **once per datagram** with `(sender "host:port", data,
+> socket)` -- in that order -- and keeps delivering, so there is nothing to
+> `read`. And the engine only **writes to an open socket**: `write ... to socket
+> "host:port"` on a name you never opened sends nothing. Open it once with
+> `open datagram socket to "host:port"` (the helpers' `scOscSend` /
+> `scArtnetSend` do it for you). Broadcasting (ArtPoll) also needs
+> `set the allowDatagramBroadcasts to true`.
+
+(Or let the helpers route for you: `accept datagram connections on port 9000 with
+message "socketReceived"` and write `on scOscMessage pAddress, pArgs, pSender` --
+bundles are unpacked for you.)
 
 `oscParse` returns an **Array** with keys `address`, `types` (the type-tag string,
 e.g. `"f"`), `args` (a 1-based list of decoded values), and `isBundle`
@@ -129,10 +140,13 @@ Note you build the args array by assignment with `scAddArg` - LiveCode Script ha
 on mouseUp
    local tArgs
    scAddArg tArgs, "f", 0.75
-   put oscBuildMessage("/composition/layers/1/video/opacity/values", tArgs) into tData
-   write tData to socket "127.0.0.1:7000"
+   scOscSend "127.0.0.1", 7000, "/composition/layers/1/video/opacity/values", tArgs
 end mouseUp
 ```
+
+`scOscSend` (in the helpers) opens the datagram socket on first use, builds the
+message and writes it. By hand that is `open datagram socket to "127.0.0.1:7000"`
+once, then `write tData to socket "127.0.0.1:7000"`.
 
 That's the whole OSC loop: build `Data`, write it to `host:port`; receive `Data`
 in your socket handler, `oscParse` it. To match an incoming address against a
@@ -141,7 +155,7 @@ pattern with wildcards (`? * [ ] { }`), use
 
 > **Round-trip check.** With no external app, send to yourself: open the receive
 > socket above, then in the Message Box run
-> `local a; scAddArg a, "f", 0.5; write oscBuildMessage("/1/fader1", a) to socket "127.0.0.1:9000"`
+> `local a; scAddArg a, "f", 0.5; scOscSend "127.0.0.1", 9000, "/1/fader1", a`
 > and watch the scrollbar jump to mid-travel. (For a full automated version, run
 > `examples/selftest.livecodescript` - see [testing-in-oxt.md](testing-in-oxt.md).)
 
@@ -260,7 +274,7 @@ on faderChanged
    -- Build a 512-byte universe; set channel 1 from a 0-255 fader.
    put the thumbPosition of me into tLevel -- assume a 0-255 fader
    put numToByte(tLevel) into tChannels -- channel 1 = byte 1
-   write artnetBuildDmx(0, tChannels) to socket "2.0.0.10:6454"
+   scArtnetSend "2.0.0.10", 0, tChannels  -- opens the socket once, then writes
 end faderChanged
 ```
 
@@ -273,7 +287,8 @@ the current universe state at a fixed ~40 Hz rather than on every fader move.
 `opcode`, `universe`, `sequence`, `length`, and `channels` (the `Data`):
 
 ```
-on dmxArrived pSocket, pData
+-- accept datagram connections on port 6454 with message "dmxArrived"
+on dmxArrived pSender, pData
    put artnetParseDmx(pData) into tDmx
    if tDmx["opcode"] is "ArtDmx" and tDmx["universe"] is 0 then
       set the backgroundColor of graphic "Lamp" to \
@@ -281,7 +296,6 @@ on dmxArrived pSocket, pData
           byteToNum(byte 2 of tDmx["channels"]) & "," & \
           byteToNum(byte 3 of tDmx["channels"]))
    end if
-   read from socket pSocket with message "dmxArrived"
 end dmxArrived
 ```
 
@@ -290,15 +304,18 @@ end dmxArrived
 
 ```
 on discoverNodes
+   -- nodes reply to port 6454, so listen there; broadcasting must be allowed
+   accept datagram connections on port 6454 with message "replyArrived"
+   set the allowDatagramBroadcasts to true
+   open datagram socket to "255.255.255.255:6454"
    write artnetBuildPoll() to socket "255.255.255.255:6454" -- broadcast
 end discoverNodes
 
-on replyArrived pSocket, pData
+on replyArrived pSender, pData
    put artnetParseReply(pData) into tNode
    if tNode["opcode"] is "ArtPollReply" then
       put tNode["longName"] && "(" & tNode["ip"] & ")" & return after field "Nodes"
    end if
-   read from socket pSocket with message "replyArrived"
 end replyArrived
 ```
 

@@ -24,7 +24,7 @@ static void check(const char *name, int ok) {
 
 int main(void) {
     printf("midi ABI version = %d\n", midi_abi_version());
-    check("ABI version is 1", midi_abi_version() == 1);
+    check("ABI version is 2", midi_abi_version() == 2);
 
     /* Enumeration must never crash; counts are >= 0 whether or not a backend
        and ports exist. */

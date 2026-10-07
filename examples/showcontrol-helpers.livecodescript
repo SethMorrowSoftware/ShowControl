@@ -12,13 +12,26 @@
 
 local sMidiListening      -- "true" while the poll loop is running
 local sMidiPollMs         -- poll interval (ms); lower = tighter latency, more CPU
+local sMidiTarget         -- long id of the object that receives the dispatched events
 
 -- ===== MIDI poll dispatcher ================================================
 
 -- Start listening on an open input handle (from midiOpenInput). Optional second
--- arg sets the poll interval in ms (default 3).
-on scMidiStartListening pHandle, pIntervalMs
+-- arg sets the poll interval in ms (default 3). Events (scNoteOn, scMidiCC, ...)
+-- are sent to the object that called this handler -- or to pTarget if given --
+-- and travel up ITS message path, so `on scNoteOn` in that object, its card or
+-- its stack receives them.
+--
+-- Why the listener is remembered here: the poll re-arms itself with
+-- `send ... to me in N milliseconds`, and inside a timer-delivered message
+-- `the target` is this LIBRARY, not your card. Dispatching to `the target`
+-- (as this helper once did) silently delivered every timer-polled event to the
+-- library itself whenever the helpers were used via `start using` -- caught by
+-- the headless suite (tests/lcs/helpers_test.livecodescript).
+on scMidiStartListening pHandle, pIntervalMs, pTarget
    if pIntervalMs is empty then put 3 into pIntervalMs
+   if pTarget is empty then put the long id of the target into pTarget
+   put pTarget into sMidiTarget
    put pIntervalMs into sMidiPollMs
    put "true" into sMidiListening
    scMidiPollAndDispatch pHandle
@@ -31,30 +44,51 @@ end scMidiStopListening
 on scMidiPollAndDispatch pHandle
    if sMidiListening is not "true" then exit scMidiPollAndDispatch
    put midiPoll(pHandle) into tEvents
+   -- `dispatch ... with` passes REAL parameters. The old form,
+   --    send "scNoteOn" && channel && note && velocity to ...
+   -- built the string "scNoteOn 1 60 100", and a message string's parameters
+   -- are separated by COMMAS -- so the whole "1 60 100" arrived in pChannel and
+   -- pNote/pVelocity were empty (caught by tests/lcs/helpers_test).
    repeat for each element tEvent in tEvents
       switch tEvent["kind"]
          case "noteOn"
-            send "scNoteOn" && tEvent["channel"] && tEvent["data1"] && tEvent["data2"] to the target
+            dispatch "scNoteOn" to sMidiTarget with tEvent["channel"], tEvent["data1"], tEvent["data2"]
             break
          case "noteOff"
-            send "scNoteOff" && tEvent["channel"] && tEvent["data1"] && tEvent["data2"] to the target
+            dispatch "scNoteOff" to sMidiTarget with tEvent["channel"], tEvent["data1"], tEvent["data2"]
             break
          case "controlChange"
-            send "scMidiCC" && tEvent["channel"] && tEvent["data1"] && tEvent["data2"] to the target
+            dispatch "scMidiCC" to sMidiTarget with tEvent["channel"], tEvent["data1"], tEvent["data2"]
             break
          case "programChange"
-            send "scProgramChange" && tEvent["channel"] && tEvent["data1"] to the target
+            dispatch "scProgramChange" to sMidiTarget with tEvent["channel"], tEvent["data1"]
             break
          case "pitchBend"
-            send "scPitchBend" && tEvent["channel"] && tEvent["value14"] to the target
+            dispatch "scPitchBend" to sMidiTarget with tEvent["channel"], tEvent["value14"]
             break
          default
-            -- channelPressure / polyAftertouch / sysex / system: hand off raw
-            send "scMidiOther" && tEvent["kind"] && tEvent["channel"] to the target
+            -- channelPressure / polyAftertouch / sysex / system: hand off the kind,
+            -- the channel, and the whole decoded record (raw bytes in ["bytes"])
+            dispatch "scMidiOther" to sMidiTarget with tEvent["kind"], tEvent["channel"], tEvent
       end switch
    end repeat
-   send "scMidiPollAndDispatch pHandle" to me in sMidiPollMs milliseconds
+   send "scMidiPollAndDispatch" && pHandle to me in sMidiPollMs milliseconds
 end scMidiPollAndDispatch
+
+-- ===== UDP transport ========================================================
+
+-- Make sure a datagram socket to "host:port" is open before writing to it. The
+-- engine only writes to an OPEN socket: `write ... to socket "h:p"` on a name
+-- that was never opened sets the result to "socket is not open" and sends
+-- NOTHING, silently (engine/src/exec-network.cpp, MCNetworkExecWriteToSocket).
+-- Opening is idempotent here, so call it before every send.
+-- (Broadcast -- e.g. ArtPoll to 255.255.255.255 -- additionally needs
+-- `set the allowDatagramBroadcasts to true`.)
+command scEnsureDatagramSocket pHostPort
+   if pHostPort is not among the lines of the openSockets then
+      open datagram socket to pHostPort
+   end if
+end scEnsureDatagramSocket
 
 -- ===== OSC convenience =====================================================
 
@@ -98,31 +132,57 @@ on scOscSend pHost, pPort, pAddress, pArgs
       -- oscLastError() explains why
       exit scOscSend
    end if
-   -- Use a uniquely-named connectionless UDP socket per host:port.
+   scEnsureDatagramSocket pHost & ":" & pPort
    write tData to socket (pHost & ":" & pPort)
 end scOscSend
 
--- Drop this into a card with an open datagram socket; it routes by address.
--- (Wire your own `on scOscMessage tAddress, tArgs` to react.)
-on socketReceived pData, pHostAndPort
+-- Route inbound OSC by address. Wire it up with
+--     accept datagram connections on port 9000 with message "socketReceived"
+-- and write your own `on scOscMessage pAddress, pArgs, pSender` to react
+-- (pArgs is the parsed argument array; bundles are unpacked, nested ones too).
+--
+-- The engine calls a datagram message with (sender "host:port", data, socket)
+-- -- in THAT order (engine/src/opensslsocket.cpp, MCSocket::readsome). This
+-- handler once declared (pData, pHostAndPort), so it parsed the sender's address
+-- as OSC and never routed anything; it also issued a blocking `read from socket`,
+-- which an accepted datagram socket does not need (every datagram arrives as its
+-- own message). For callers wired the old way round, a packet in the first
+-- parameter is still recognised.
+on socketReceived pSender, pData
    local tMsg
-   put oscParse(pData) into tMsg
-   if tMsg["isBundle"] then
-      local tSub
-      repeat for each element tSub in tMsg["messages"]
-         send "scOscMessage" && tSub["address"] to the target
-      end repeat
-   else if tMsg["address"] is not empty then
-      send "scOscMessage" && tMsg["address"] to the target
+   if scLooksLikeOsc(pSender) and not scLooksLikeOsc(pData) then
+      put oscParse(pSender) into tMsg
+      put pData into pSender
+   else
+      put oscParse(pData) into tMsg
    end if
-   -- keep the datagram socket reading
-   read from socket pHostAndPort for 65535
+   scOscRoute tMsg, pSender, the long id of the target
 end socketReceived
+
+-- Deliver one parsed message (or every message of a bundle, recursively).
+command scOscRoute pMsg, pSender, pTarget
+   local tSub
+   if pMsg["isBundle"] is true then
+      repeat for each element tSub in pMsg["messages"]
+         scOscRoute tSub, pSender, pTarget
+      end repeat
+   else if pMsg["address"] is not empty then
+      dispatch "scOscMessage" to pTarget with pMsg["address"], pMsg["args"], pSender
+   end if
+end scOscRoute
+
+function scLooksLikeOsc pX
+   if char 1 of pX is "/" then
+      return true
+   end if
+   return (byte 1 to 8 of pX) is ("#bundle" & numToByte(0))
+end scLooksLikeOsc
 
 -- ===== Art-Net convenience =================================================
 
 -- Send a DMX universe (pChannels: up to 512 bytes) to an Art-Net node.
 on scArtnetSend pHost, pUniverse, pChannels
+   scEnsureDatagramSocket pHost & ":6454"
    write artnetBuildDmx(pUniverse, pChannels) to socket (pHost & ":6454")
 end scArtnetSend
 
@@ -131,6 +191,7 @@ end scArtnetSend
 -- extension itself is pure LCB and cannot open sockets, so this lives here in
 -- the script helper layer.
 on artnetSendDmx pUniverse, pChannels, pHost
+   scEnsureDatagramSocket pHost & ":6454"
    write artnetBuildDmx(pUniverse, pChannels) to socket (pHost & ":6454")
 end artnetSendDmx
 

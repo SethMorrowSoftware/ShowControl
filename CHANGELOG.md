@@ -5,6 +5,63 @@ where they diverge; the project as a whole tracks the headline milestones below.
 
 ## [Unreleased] - v1 foundation
 
+### Hardware-free automated testing of the whole stack -- and what it found
+
+The repo assumed OXT was a GUI runtime with no headless way to compile or run
+`.lcb` / `.livecodescript`, so only the C shims had tests. Every OXT build ships
+`lc-compile`, `lc-run` (the LCB VM as a console program, with the FFI) and a
+standalone engine that runs with `-ui`; the new suites use them, in CI on Linux,
+Windows and macOS against a pinned, checksum-verified OXT-Beyond release
+(`.github/workflows/test.yml`). Guide: [`docs/testing.md`](docs/testing.md).
+
+- **LCB under lc-run** (`tools/run-lcb-tests.py`, `tests/lcb/`): the bindings are
+  compiled by lc-compile and every public handler runs; one process per test.
+- **LiveCode Script in the engine** (`tools/run-lcs-tests.py`, `tests/lcs/`): an
+  in-engine compile gate over every `.livecodescript` (Script compile errors are
+  otherwise silent), the Script<->LCB boundary, the shipped helpers and self-test,
+  real UDP through the engine's sockets, and interop with independent peers.
+- **MIDI with no hardware**: a mock RtMidi library (`tests/mock/rtmidi_mock.c`
+  behind the real shim, built as `build/mock/midi`) with a virtual loopback cable
+  and a sent log. It never ships (release staging excludes it; packaging refuses
+  any binary exporting `midimock_*`).
+- **Virtual peers** (`tools/sim/`): a virtual Art-Net node and OSC peer on clean-room
+  codecs -- the interop suite's other end, and handy by hand.
+- **Shared wire-format vectors** (`tests/vectors/`): one source of truth, checked by
+  clean-room codecs + python-osc, by C (generated `vectors.h`, freshness-gated) and
+  by LCB.
+- **Fuzzing**: `tests/fuzz/osc_fuzz.c` -- a deterministic mutation fuzzer in ctest,
+  libFuzzer + ASan/UBSan in CI, with dump/replay.
+- **Static gates**: the false "LCB has no and/or" rule is gone; new rules for
+  `returns ZString`, `does not contain`, `repeat ... step`; a `put [...]` false
+  negative fixed; every rule has a fixture (`tests/checker_fixtures_test.py`).
+
+Bugs found and fixed on the first runs:
+
+- **Security -- remote out-of-bounds read in `osc_parse`.** A `,` hidden in the
+  address padding desynchronized tinyosc's cursor from the validated layout; one
+  72-byte datagram crashed any listening app. Values are now decoded at the
+  validator's offsets. (Fuzzer, seed 7 / iteration 360207; pinned as a vector.)
+- **The OSC and MIDI bindings failed on every byte-buffer path** -- a `Data` does
+  not bridge to a foreign `Pointer`. Now `MCDataGetBytePtr` / `MCMemoryAllocate` /
+  `MCDataCreateWithBytes` (Phase 0 resolved, [phase0-ffi-spike.md](docs/phase0-ffi-spike.md)).
+- **Returning a `ZString` from a foreign handler crashed the VM** (`oscLastError()`
+  alone) -- the engine frees it. All strings now come through caller buffers.
+- **`oscBuildMessage` accepts numbers directly** (`is a number` / `formatted as
+  string` exist on the 9.6.3 floor) -- no `& empty` needed; a trailing `T/F/N/I`
+  needs no value; malformed arg lists build nothing.
+- **MIDI ABI 2**: `midi_in_drain_bytes` (the binding copies exactly the drained
+  bytes); and Windows-MM virtual ports are refused instead of returning a handle
+  that sent nowhere. **The committed MIDI binaries must be refreshed (ABI 2)** --
+  CI's refresh PR does this after merge.
+- **Helpers / examples**: the MIDI dispatcher passed `"1 60 100"` as ONE parameter
+  (message strings split on commas) and, used as a library, delivered timer-polled
+  events to itself; `socketReceived` had its parameters reversed (the engine sends
+  `(sender, data, socket)`) and issued a blocking read; every example wrote to
+  sockets it never opened (the engine drops those: "socket is not open").
+- **Docs**: the UDP receive/send snippets now follow the engine's actual contract
+  (verified in its source and pinned by `tests/lcs/udp_test`).
+
+
 The initial implementation scaffold: a verified native core, the three LCB
 bindings, the build/test/CI machinery, and the documentation set.
 

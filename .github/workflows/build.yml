@@ -1,18 +1,14 @@
 name: build
 
-# Builds the ShowControl native shims (osc, midi) and runs every gate for each
-# supported target, then attaches the binaries to a published GitHub Release.
-# The Art-Net extension is pure LCB -- it has no native build; its wire format is
-# gated by the Python golden-packet test in the `static` job below.
+# Fast per-push feedback for the native shims (osc, midi): the static gates, an
+# ASan/UBSan run of the C tests, and a build + test on Linux, macOS (universal)
+# and Windows (x64 + x86). Its builds are NOT what ships -- stock runners give
+# glibc 2.39 / dynamic runtimes. The committed, portable, verified libraries come
+# from release-binaries.yml; a published Release attaches THOSE (see `release`).
+# The Art-Net extension is pure LCB -- it has no native build.
 #
-# Targets (osc has no external deps; midi links the platform MIDI backend):
-#   linux-x86_64    64-bit, manylinux2014 container -> glibc 2.17 floor
-#   linux-i686      32-bit, manylinux2014 container (OSC only; see note)
-#   macos-universal arm64 + x86_64 in one dylib
-#   windows-x64 / windows-x86   MSVC
-#
-# Triggers: pushes to main and PRs build + test (no attach); a published Release
-# builds + attaches; a manual run with release_tag attaches after the fact.
+# Triggers: pushes to main and PRs build + test; a published Release attaches the
+# committed binaries; a manual run with release_tag attaches after the fact.
 
 on:
   push:
@@ -40,8 +36,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Static .lcb / .livecodescript gates
-        run: python3 tools/check-livecodescript.py
+      - name: Static .lcb / .livecodescript gates (+ their fixtures)
+        run: |
+          python3 tests/checker_fixtures_test.py
+          python3 tools/check-livecodescript.py
       - name: Art-Net golden-packet spec
         run: python3 tests/artnet_golden_test.py
       - name: ALSA headers (for the MIDI shim)
@@ -61,12 +59,15 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
         run: |
+          # STATIC_RUNTIME=OFF: a private static libstdc++ inside midi.so would sit
+          # between our code and ASan's allocator interception; this job is about
+          # OUR memory safety -- the shipped lanes (release-binaries.yml) keep it ON.
           cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-            -DSHOWCONTROL_BUILD_TESTS=ON \
+            -DSHOWCONTROL_BUILD_TESTS=ON -DSHOWCONTROL_STATIC_RUNTIME=OFF \
             -DCMAKE_C_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer"
           cmake --build build-asan -j
-          ctest --test-dir build-asan --output-on-failure
+          ctest --test-dir build-asan --output-on-failure --no-tests=error
 
   # Linux x86_64 on a modern toolchain. (Maximally-portable glibc-2.17 binaries
   # via a manylinux container, and 32-bit Linux, are follow-ups -- RtMidi's C++
@@ -83,12 +84,14 @@ jobs:
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON
           cmake --build build --config Release
-          ctest --test-dir build --output-on-failure
+          ctest --test-dir build --output-on-failure --no-tests=error
       - name: Stage libraries
         run: |
           mkdir -p dist
-          cp "$(find build -maxdepth 2 -name osc.so  | head -n1)" dist/osc-linux-x86_64.so
-          cp "$(find build -maxdepth 2 -name midi.so | head -n1)" dist/midi-linux-x86_64.so
+          # -not -path '*/mock/*': the test build also emits the MOCK midi library
+          # (tests/mock/rtmidi_mock.c) as build/mock/midi.so -- never ship that.
+          cp "$(find build -maxdepth 2 -name osc.so  -not -path '*/mock/*' | head -n1)" dist/osc-linux-x86_64.so
+          cp "$(find build -maxdepth 2 -name midi.so -not -path '*/mock/*' | head -n1)" dist/midi-linux-x86_64.so
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -124,13 +127,14 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
       - name: Smoke test
-        run: ctest --test-dir build --build-config Release --output-on-failure
+        run: ctest --test-dir build --build-config Release --output-on-failure --no-tests=error
       - name: Stage libraries
         shell: bash
         run: |
           mkdir -p dist
           for lib in osc midi; do
-            src="$(find build -maxdepth 2 -name "${lib}.${{ matrix.ext }}" | head -n1)"
+            # never the MOCK midi library the test build puts in build/mock/
+            src="$(find build -maxdepth 2 -name "${lib}.${{ matrix.ext }}" -not -path '*/mock/*' | head -n1)"
             test -n "$src" || { echo "missing ${lib}.${{ matrix.ext }}"; exit 1; }
             cp "$src" "dist/${lib}-${{ matrix.name }}.${{ matrix.ext }}"
           done
@@ -141,121 +145,43 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Release assets are the COMMITTED, verified libraries -- the same files an
+  # installed extension carries -- not this workflow's stock-runner builds (which
+  # exist for fast per-push feedback and are not portable: glibc 2.39, dynamic
+  # runtimes). The committed tree is produced by release-binaries.yml and must
+  # pass the freshness gate before anything is attached.
   release:
-    name: attach binaries to the release
+    name: attach the committed binaries to the release
     needs: [ build-linux, build-native ]
     if: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Attach binaries to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.release_tag }}
-        run: |
-          echo "Attaching binaries to release: $TAG"
-          gh release upload "$TAG" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
-
-  # When the osc/midi shim SOURCES change on main (or on a manual run), take the
-  # per-platform binaries this workflow just built and drop them into the committed
-  # src/<ext>/code/<platform-id>/ trees, then open/update ONE PR with the result.
-  # This automates what tools/package-extension.py does by hand.
-  #
-  # Why a PR (not a direct push to main): the compiled libraries are NOT
-  # byte-reproducible (build-ids / timestamps differ run to run), and main may be
-  # branch-protected. A PR keeps main's history clean, is reviewable, and works
-  # regardless of protection. The job is gated to ACTUAL shim-source changes so it
-  # never churns on doc-only pushes, and code/ is excluded from the trigger diff so
-  # merging the refresh PR can't re-trigger it (no loop).
-  #
-  # One-time repo setting this needs: Settings -> Actions -> General ->
-  # "Allow GitHub Actions to create and approve pull requests". (A PR opened by the
-  # built-in GITHUB_TOKEN does not itself trigger CI -- which is fine here: the
-  # binaries were already built and tested by the jobs above, and it avoids a loop.)
-  package-binaries:
-    name: refresh committed code/ trees (open a PR)
-    needs: [ build-linux, build-native ]
-    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
+    env:
+      TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.release_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # need history to diff the push range
-      - name: Decide whether a refresh is warranted
-        id: gate
+          ref: ${{ env.TAG }}
+      - name: The committed binaries must be fresh
+        run: python3 tools/check-binary-freshness.py
+      - name: Stage <ext>-<platform-id>.<suffix> + the manifests
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "manual run -> refresh"; echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          base="${{ github.event.before }}"
-          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
-            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          # Refresh only when the shim SOURCES changed -- not on doc-only pushes, and
-          # not on a code/ binary commit (excluded), so the refresh PR can't loop.
-          if git diff --name-only "$base" "${{ github.sha }}" -- \
-               src/osc src/midi src/third_party CMakeLists.txt ':(exclude)src/**/code/**' \
-               | grep -q .; then
-            echo "shim sources changed -> refresh"; echo "go=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "no shim source change -> skip"; echo "go=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Download the built per-platform binaries
-        if: steps.gate.outputs.go == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: dl
-          merge-multiple: true
-      - name: Place binaries into src/<ext>/code/<platform-id>/
-        if: steps.gate.outputs.go == 'true'
-        run: |
-          # Map the staged artifact names onto the committed slots. 32-bit Linux
-          # (x86-linux) is not built by CI yet, so that slot is left untouched.
-          python3 tools/package-extension.py \
-            --osc-linux64 dl/osc-linux-x86_64.so       --midi-linux64 dl/midi-linux-x86_64.so \
-            --osc-mac     dl/osc-macos-universal.dylib  --midi-mac    dl/midi-macos-universal.dylib \
-            --osc-win64   dl/osc-windows-x64.dll        --midi-win64  dl/midi-windows-x64.dll \
-            --osc-win32   dl/osc-windows-x86.dll        --midi-win32  dl/midi-windows-x86.dll
-          python3 tools/package-extension.py --check || true   # informational (x86-linux stays empty)
-      - name: Open or update the refresh PR
-        if: steps.gate.outputs.go == 'true'
+          mkdir -p dist
+          for f in src/osc/code/*/osc.* src/midi/code/*/midi.*; do
+            pid=$(basename "$(dirname "$f")"); base=$(basename "$f"); ext=${base%%.*}
+            cp "$f" "dist/${ext}-${pid}.${base#*.}"
+          done
+          cp src/osc/code/MANIFEST.sha256 dist/osc-MANIFEST.sha256
+          cp src/midi/code/MANIFEST.sha256 dist/midi-MANIFEST.sha256
+          ls -l dist
+      - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          branch="ci/refresh-native-binaries"
-          git checkout -B "$branch"                 # branch from current main, keep the placed files
-          git add src/osc/code src/midi/code
-          if git diff --cached --quiet; then
-            echo "Built binaries are identical to the committed ones; nothing to do."
-            exit 0
-          fi
-          git commit -m "CI: refresh committed native binaries from ${GITHUB_SHA::7} [skip ci]"
-          git push -f origin "$branch"
-          echo "Binaries built, placed, and pushed to branch '$branch'."
-          # Opening/updating the PR is BEST-EFFORT. If the repo hasn't enabled
-          # "Allow GitHub Actions to create and approve pull requests", gh fails
-          # here -- but the binaries are already safely on the branch, so the job's
-          # real work succeeded. Surface a clear, actionable warning instead of
-          # failing the whole job (which reads as "nothing got built").
-          pr_body="Automated refresh of src/<ext>/code/<platform-id>/ from the latest build of osc_shim.c / midi_shim.c (source commit ${GITHUB_SHA::7}), built and tested by the build workflow. Merge to update the committed, ready-to-package binaries. 32-bit Linux (x86-linux) is not built by CI yet, so that slot is unchanged."
-          open_count=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq 'length' 2>/dev/null || echo 0)
-          if [ "${open_count:-0}" -gt 0 ]; then
-            echo "Existing open PR was updated by the force-push."
-          elif gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
-                 --title "CI: refresh committed native binaries" --body "$pr_body"; then
-            echo "Opened the refresh PR."
-          else
-            note="Native binaries were built and pushed to branch '$branch', but the PR could not be opened automatically (usually: Settings -> Actions -> General -> 'Allow GitHub Actions to create and approve pull requests' is off). Enable it and re-run, or open the PR by hand: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${branch}?expand=1"
-            echo "::warning::${note}"
-            { echo "### Native binaries refreshed - PR not auto-opened"; echo; echo "${note}"; } >> "$GITHUB_STEP_SUMMARY"
-          fi
+        run: gh release upload "$TAG" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+
+  # (The former `package-binaries` job -- which opened an automatic PR with this
+  # workflow's stock builds after every shim push to main -- is replaced by
+  # .github/workflows/release-binaries.yml: portable lanes for all six platform
+  # ids, verification before anything lands, and a commit only when a person
+  # dispatches it. The xtalk-suite's rule: automatic workflows never commit.)

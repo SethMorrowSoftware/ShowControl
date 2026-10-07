@@ -27,6 +27,63 @@ option(SHOWCONTROL_BUILD_TESTS "Build the C smoke tests" OFF)
 option(SHOWCONTROL_BUILD_OSC   "Build the OSC shim"  ON)
 option(SHOWCONTROL_BUILD_MIDI  "Build the MIDI shim" ON)
 
+# ---------------------------------------------------------------------------
+# Portable runtime (default ON): the shipped libraries must load on a machine
+# that has nothing but the OS and the engine.
+#   * MSVC: the static CRT (/MT). A /MD build needs VCRUNTIME140 (and, for the
+#     C++ in RtMidi, MSVCP140) installed -- the committed DLLs did, and fail to
+#     load on a Windows box without the VC++ redistributable. Nothing allocated
+#     in our DLLs is freed by the engine (every buffer is caller-owned), so a
+#     private CRT is safe.
+#   * GCC/Linux: -static-libstdc++ -static-libgcc for midi (RtMidi is C++), so
+#     the .so does not demand the build host's libstdc++ GLIBCXX version.
+#     The version script (below) keeps those runtime symbols LOCAL.
+# Must be set before any target -- including the fetched RtMidi -- is created.
+# ---------------------------------------------------------------------------
+option(SHOWCONTROL_STATIC_RUNTIME "Link the C/C++ runtime statically into the shipped libraries" ON)
+if(SHOWCONTROL_STATIC_RUNTIME AND MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+# ---------------------------------------------------------------------------
+# Export ONLY the <prefix>_* C ABI (xtalk-suite's discipline; enforced by
+# tools/check-binary-freshness.py). ELF: a linker version script (src/<ext>/
+# <ext>.map). Mach-O has no version scripts, so the list is DERIVED from the
+# same .map at configure time -- one source of truth, two linker flags.
+# Windows exports only the OSC_API / MIDI_API (dllexport) symbols anyway.
+# ---------------------------------------------------------------------------
+include(CheckLinkerFlag)
+function(showcontrol_export_only target map_file)
+    if(APPLE)
+        file(READ "${map_file}" _txt)
+        string(REGEX REPLACE "/\\*([^*]|\\*+[^*/])*\\*+/" "" _txt "${_txt}")
+        string(REGEX MATCH "global:(.*)local:" _unused "${_txt}")
+        string(REPLACE ";" "" _globals "${CMAKE_MATCH_1}")
+        string(REPLACE "\n" ";" _globals "${_globals}")
+        set(_lines "")
+        foreach(_tok IN LISTS _globals)
+            string(STRIP "${_tok}" _tok)
+            if(NOT _tok STREQUAL "")
+                string(APPEND _lines "_${_tok}\n")
+            endif()
+        endforeach()
+        if(_lines STREQUAL "")
+            message(FATAL_ERROR "showcontrol_export_only: no symbols parsed from ${map_file} -- "
+                                "an empty export list would ship a library with nothing to bind")
+        endif()
+        set(_exp "${CMAKE_CURRENT_BINARY_DIR}/${target}.exported_symbols")
+        file(WRITE "${_exp}" "${_lines}")
+        target_link_options(${target} PRIVATE "-Wl,-exported_symbols_list,${_exp}")
+        set_target_properties(${target} PROPERTIES LINK_DEPENDS "${map_file}")
+    elseif(UNIX)
+        check_linker_flag(C "-Wl,--version-script=${map_file}" SHOWCONTROL_HAVE_VERSION_SCRIPT_${target})
+        if(SHOWCONTROL_HAVE_VERSION_SCRIPT_${target})
+            target_link_options(${target} PRIVATE "-Wl,--version-script=${map_file}")
+            set_target_properties(${target} PROPERTIES LINK_DEPENDS "${map_file}")
+        endif()
+    endif()
+endfunction()
+
 if(SHOWCONTROL_BUILD_TESTS)
     enable_testing()
 endif()
@@ -57,6 +114,7 @@ if(SHOWCONTROL_BUILD_OSC)
     if(WIN32)
         target_link_libraries(osc PRIVATE ws2_32)
     endif()
+    showcontrol_export_only(osc "${CMAKE_CURRENT_SOURCE_DIR}/src/osc/osc.map")
 
     # Keep our shim warning-clean; tinyosc's own (vendored) warnings are not fatal
     # (no -Werror), exactly as Box2Dxt treats Box2D.
@@ -77,6 +135,25 @@ if(SHOWCONTROL_BUILD_OSC)
             target_link_libraries(osc_smoke PRIVATE m)
         endif()
         add_test(NAME osc_smoke COMMAND osc_smoke)
+
+        # The shared wire-format vectors (tests/vectors/osc.json, projected into
+        # the committed tests/vectors/vectors.h by tools/gen_vectors.py).
+        add_executable(osc_vectors tests/osc_vectors_test.c)
+        target_include_directories(osc_vectors PRIVATE src/osc tests)
+        target_link_libraries(osc_vectors PRIVATE osc)
+        if(NOT MSVC)
+            target_link_libraries(osc_vectors PRIVATE m)
+        endif()
+        add_test(NAME osc_vectors COMMAND osc_vectors)
+
+        # Deterministic mutation fuzzer over osc_parse + every getter, seeded from
+        # the vectors (tests/fuzz/osc_fuzz.c). Under the ASan/UBSan CI build every
+        # one of these iterations is sanitizer-checked; the coverage-guided
+        # libFuzzer build of the same file runs in the CI "fuzz" job.
+        add_executable(osc_fuzz tests/fuzz/osc_fuzz.c)
+        target_include_directories(osc_fuzz PRIVATE src/osc tests)
+        target_link_libraries(osc_fuzz PRIVATE osc)
+        add_test(NAME osc_fuzz COMMAND osc_fuzz 100000 1)
     endif()
 endif()
 
@@ -99,6 +176,17 @@ if(SHOWCONTROL_BUILD_MIDI)
     set(BUILD_SHARED_LIBS        OFF)
     FetchContent_MakeAvailable(rtmidi)
 
+    # RtMidi's CMake sets RTMIDI_EXPORT unconditionally -- even for this static
+    # build -- which marks every RtMidi class and its C API __declspec(dllexport)
+    # / visibility("default"), so they leaked out of midi.dll (~100 symbols).
+    # Without it, RTMIDIAPI is empty (rtmidi_c.h) and the classes plain; the
+    # version script / export list then hides the rest on ELF / Mach-O.
+    get_target_property(_rt_defs rtmidi COMPILE_DEFINITIONS)
+    if(_rt_defs)
+        list(REMOVE_ITEM _rt_defs RTMIDI_EXPORT)
+        set_property(TARGET rtmidi PROPERTY COMPILE_DEFINITIONS "${_rt_defs}")
+    endif()
+
     add_library(midi SHARED src/midi/midi_shim.c)
     target_include_directories(midi PRIVATE src/midi ${rtmidi_SOURCE_DIR})
     # RtMidi exports its target as rtmidi (and an alias RtMidi::rtmidi on newer tags).
@@ -114,6 +202,10 @@ if(SHOWCONTROL_BUILD_MIDI)
         C_VISIBILITY_PRESET hidden
         OUTPUT_NAME "midi"
         PREFIX "")
+    showcontrol_export_only(midi "${CMAKE_CURRENT_SOURCE_DIR}/src/midi/midi.map")
+    if(SHOWCONTROL_STATIC_RUNTIME AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT APPLE)
+        target_link_options(midi PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
 
     if(MSVC)
         target_compile_options(midi PRIVATE /W3)
@@ -141,6 +233,7 @@ endif()
 if(SHOWCONTROL_BUILD_TESTS)
     add_executable(midi_mock_smoke
         src/midi/midi_shim.c
+        tests/mock/rtmidi_mock.c
         tests/midi_mock_smoke_test.c)
     # tests/mock FIRST so the shim's #include "rtmidi_c.h" resolves to the mock.
     target_include_directories(midi_mock_smoke PRIVATE tests/mock src/midi)
@@ -151,6 +244,44 @@ if(SHOWCONTROL_BUILD_TESTS)
         target_compile_options(midi_mock_smoke PRIVATE -Wall -Wextra)
     endif()
     add_test(NAME midi_mock_smoke COMMAND midi_mock_smoke)
+
+    # -----------------------------------------------------------------------
+    # The MOCK midi shared library: the real midi_shim.c over the RtMidi test
+    # double, built under the SAME bare name "midi" but into <build>/mock/, so it
+    # is a drop-in for the shipped library. tools/run-lcb-tests.py stages it for
+    # the headless LCB suite: midi.lcb's "c:midi>" bindings then run the whole
+    # MIDI stack (binding + FFI marshalling + shim) end to end with no hardware
+    # and no OS MIDI service. It also exports the midimock_* controls (inject
+    # inbound, loopback cable, sent log) that tests/lcb/midi_test.lcb binds.
+    # NEVER packaged: package-extension.py only ever copies the real "midi".
+    # -----------------------------------------------------------------------
+    add_library(midi_mock SHARED
+        src/midi/midi_shim.c
+        tests/mock/rtmidi_mock.c)
+    target_include_directories(midi_mock PRIVATE tests/mock src/midi)
+    set_target_properties(midi_mock PROPERTIES
+        C_STANDARD 17
+        C_STANDARD_REQUIRED ON
+        C_VISIBILITY_PRESET hidden
+        OUTPUT_NAME "midi"
+        PREFIX ""
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mock"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mock"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mock")
+    # Multi-config generators (MSVC, Xcode) append /<Config>; pin every config to
+    # the same folder so the runner finds it without guessing.
+    foreach(cfg Debug Release RelWithDebInfo MinSizeRel)
+        string(TOUPPER ${cfg} CFG)
+        set_target_properties(midi_mock PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY_${CFG} "${CMAKE_BINARY_DIR}/mock"
+            RUNTIME_OUTPUT_DIRECTORY_${CFG} "${CMAKE_BINARY_DIR}/mock"
+            ARCHIVE_OUTPUT_DIRECTORY_${CFG} "${CMAKE_BINARY_DIR}/mock")
+    endforeach()
+    if(MSVC)
+        target_compile_options(midi_mock PRIVATE /W3)
+    else()
+        target_compile_options(midi_mock PRIVATE -Wall -Wextra)
+    endif()
 endif()
 
 # Build:

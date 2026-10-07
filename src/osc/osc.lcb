@@ -19,8 +19,7 @@ Conventions (shared across ShowControl):
     handle is a harmless no-op. Script never sees a handle -- every public
     handler brackets create...use...free internally.
   * Byte buffers (OSC datagrams, blobs) are LiveCode `Data`. They cross the FFI
-    as a (Pointer, length) pair: an inbound `Data` bridges to a pointer to its
-    first byte; an outbound buffer is a pre-sized `Data` the shim fills in place.
+    as a (Pointer, length) pair -- see the MARSHALLING note below.
   * Short strings (address, type tag, errors) cross as ZStringUTF8.
   * 64-bit integers / timetags have no foreign type in the engine, so they cross
     as decimal STRINGS.
@@ -29,13 +28,19 @@ The foreign handlers bind to the shared library "osc" (built by CMakeLists.txt
 and bundled inside the extension under code/<arch>-<platform>/osc.{so,dll,dylib}).
 The exported C ABI symbols use the stable "osc_" prefix.
 
-  --- MARSHALLING NOTE (Phase 0 empirical confirmation; see docs/phase0-ffi-spike.md) ---
-  Passing a `Data` to a foreign `Pointer` parameter is expected to hand the shim
-  a pointer to the data's bytes, and a freshly built, uniquely-owned `Data`
-  passed for the out-buffer is expected to be filled in place. Box2Dxt never
-  needed byte-buffer marshalling, so this is the one detail to confirm against
-  the target engine build. The C shim API is stable regardless; only the three
-  helper handlers (makeBuffer / the *_finish readback / parse input) touch it.
+  --- MARSHALLING (Phase 0, RESOLVED -- see docs/phase0-ffi-spike.md) ---
+  A `Data` does NOT auto-bridge to a foreign `Pointer` (the LCB Language
+  Reference: "No automatic bridging from Data or String to Pointer exists" -- a
+  Data marshals as an MCDataRef). Passing one fails at call time with "Value is
+  not of correct type for passing as argument". The headless lc-run suite
+  (tests/lcb/) reproduced exactly that against the old binding. So, matching the
+  proven xtalk-suite (TorrentXT) idiom:
+    * INPUT buffers (C reads them) pass MCDataGetBytePtr(theData) -- the
+      read-only pointer to the Data's own bytes -- plus `the number of bytes in`.
+    * OUTPUT buffers (C fills them) are a raw block from the engine <builtin>
+      MCMemoryAllocate (one scratch block, grown on demand and reused); the
+      written bytes are copied back out with MCDataCreateWithBytes.
+  Only dataPtr / ensureScratch / scratchToData touch this; the C ABI is unchanged.
 */
 
 library org.openxtalk.library.osc
@@ -49,6 +54,13 @@ metadata version is "0.1.0"
 -- =====================================================================
 -- Foreign bindings to the shim (private)
 -- =====================================================================
+-- NO binding here RETURNS a C string. The engine wraps a returned ZString* in a
+-- foreign value whose finalizer free()s the pointer (libscript module-foreign.cpp
+-- __cbuffer_finalize), so returning a static buffer crashes the engine and
+-- returning a pointer into a parsed model double-frees it -- the headless suite
+-- crashed on oscLastError() alone until this was changed. Every string comes back
+-- through the shim's caller-buffer entry points (bytes-written / -needed) into
+-- the scratch block, then is decoded as UTF-8 (see shimText).
 private foreign handler _abi_version() returns CInt binds to "c:osc>osc_abi_version!cdecl"
 
 -- building
@@ -58,7 +70,7 @@ private foreign handler _build_new(in pAddr as ZStringUTF8) returns CInt binds t
 -- decimal string to its Number type. (The non-str osc_build_add_int32/_float/_double
 -- C symbols still exist for the C smoke test, but the binding does not use them.)
 private foreign handler _build_add_string(in pH as CInt, in pV as ZStringUTF8) returns CInt binds to "c:osc>osc_build_add_string!cdecl"
-private foreign handler _build_add_blob(in pH as CInt, in pData as Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_build_add_blob!cdecl"
+private foreign handler _build_add_blob(in pH as CInt, in pData as optional Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_build_add_blob!cdecl"
 private foreign handler _build_add_true(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_true!cdecl"
 private foreign handler _build_add_false(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_false!cdecl"
 private foreign handler _build_add_nil(in pH as CInt) returns CInt binds to "c:osc>osc_build_add_nil!cdecl"
@@ -76,56 +88,178 @@ private foreign handler _build_free(in pH as CInt) returns nothing binds to "c:o
 
 -- bundles
 private foreign handler _bundle_new_str(in pDec as ZStringUTF8) returns CInt binds to "c:osc>osc_bundle_new_str!cdecl"
-private foreign handler _bundle_add_message(in pH as CInt, in pMsg as Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_bundle_add_message!cdecl"
+private foreign handler _bundle_add_message(in pH as CInt, in pMsg as optional Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_bundle_add_message!cdecl"
 private foreign handler _bundle_finish(in pH as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_bundle_finish!cdecl"
 private foreign handler _bundle_free(in pH as CInt) returns nothing binds to "c:osc>osc_bundle_free!cdecl"
 
 -- parsing
-private foreign handler _parse(in pData as Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_parse!cdecl"
+private foreign handler _parse(in pData as optional Pointer, in pLen as CInt) returns CInt binds to "c:osc>osc_parse!cdecl"
 private foreign handler _is_bundle(in pH as CInt) returns CInt binds to "c:osc>osc_is_bundle!cdecl"
-private foreign handler _bundle_timetag_z(in pH as CInt) returns ZStringUTF8 binds to "c:osc>osc_bundle_timetag_z!cdecl"
+private foreign handler _bundle_timetag_str(in pH as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_bundle_timetag_str!cdecl"
 private foreign handler _bundle_count(in pH as CInt) returns CInt binds to "c:osc>osc_bundle_count!cdecl"
 private foreign handler _bundle_message(in pH as CInt, in pI as CInt) returns CInt binds to "c:osc>osc_bundle_message!cdecl"
-private foreign handler _address_z(in pH as CInt) returns ZStringUTF8 binds to "c:osc>osc_address_str!cdecl"
-private foreign handler _typetag_z(in pH as CInt) returns ZStringUTF8 binds to "c:osc>osc_typetag_str!cdecl"
+private foreign handler _address(in pH as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_address!cdecl"
+private foreign handler _typetag(in pH as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_typetag!cdecl"
 private foreign handler _arg_count(in pH as CInt) returns CInt binds to "c:osc>osc_arg_count!cdecl"
 private foreign handler _arg_type(in pH as CInt, in pI as CInt) returns CInt binds to "c:osc>osc_arg_type!cdecl"
 private foreign handler _arg_int32(in pH as CInt, in pI as CInt, out pOk as CInt) returns CInt binds to "c:osc>osc_arg_int32!cdecl"
 private foreign handler _arg_float(in pH as CInt, in pI as CInt, out pOk as CInt) returns CFloat binds to "c:osc>osc_arg_float!cdecl"
 private foreign handler _arg_double(in pH as CInt, in pI as CInt, out pOk as CInt) returns CDouble binds to "c:osc>osc_arg_double!cdecl"
-private foreign handler _arg_string_z(in pH as CInt, in pI as CInt) returns ZStringUTF8 binds to "c:osc>osc_arg_string_z!cdecl"
-private foreign handler _arg_int64_z(in pH as CInt, in pI as CInt) returns ZStringUTF8 binds to "c:osc>osc_arg_int64_z!cdecl"
+private foreign handler _arg_string(in pH as CInt, in pI as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_arg_string!cdecl"
+private foreign handler _arg_int64_str(in pH as CInt, in pI as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_arg_int64_str!cdecl"
 private foreign handler _arg_blob(in pH as CInt, in pI as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_arg_blob!cdecl"
 private foreign handler _parse_free(in pH as CInt) returns nothing binds to "c:osc>osc_parse_free!cdecl"
 
 -- matching + diagnostics
 private foreign handler _match(in pPattern as ZStringUTF8, in pAddress as ZStringUTF8) returns CInt binds to "c:osc>osc_match!cdecl"
-private foreign handler _error_z() returns ZStringUTF8 binds to "c:osc>osc_error_str!cdecl"
+private foreign handler _last_error(in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:osc>osc_last_error!cdecl"
 
 -- POSIX loader assist (Linux): preload the shim by absolute path so the
 -- engine's later bare-name "c:osc>" bind resolves to the resident copy.
+-- dlerror() returns libc-owned text, so it comes back as a raw Pointer and is
+-- COPIED with MCStringCreateWithCString -- never as a ZString the engine would free.
 private foreign handler _dlopen(in pPath as ZStringNative, in pFlags as CInt) returns optional Pointer binds to "c:>dlopen!cdecl"
-private foreign handler _dlerror() returns optional ZStringNative binds to "c:>dlerror!cdecl"
+private foreign handler _dlerror() returns optional Pointer binds to "c:>dlerror!cdecl"
+
+-- Engine <builtin> helpers for the byte-buffer FFI (libfoundation/foundation.h).
+-- A `<builtin>` handler resolves by its NAME matching the engine symbol, so these
+-- -- unlike every other private foreign handler here -- carry NO leading `_`.
+-- Declared before any helper uses them (OXT resolves identifiers lexically).
+--   * MCDataGetBytePtr: read-only pointer to a Data's own bytes (INPUT buffers).
+--   * MCMemoryAllocate/Deallocate: a raw writable block (OUTPUT buffers).
+--   * MCDataCreateWithBytes: copy C-written bytes back into a Data.
+--     A Data's byte count is uindex_t == uint32 (CUInt); the size is UIntSize.
+private foreign handler MCDataGetBytePtr(in pData as Data) returns Pointer binds to "<builtin>"
+private foreign handler MCMemoryAllocate(in pSize as UIntSize, out rBlock as Pointer) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryDeallocate(in pBlock as Pointer) returns nothing binds to "<builtin>"
+private foreign handler MCDataCreateWithBytes(in pBytes as Pointer, in pCount as CUInt, out rData as Data) returns CBool binds to "<builtin>"
+--   * MCStringDecode: bytes -> String (kMCStringEncodingUTF8 == 4).
+--   * MCStringCreateWithCString: COPY a NUL-terminated native C string we do not own.
+private foreign handler MCStringDecode(in pData as Data, in pEncoding as CInt, in pIsExternalRep as CBool, out rString as String) returns CBool binds to "<builtin>"
+private foreign handler MCStringCreateWithCString(in pCString as Pointer, out rString as String) returns CBool binds to "<builtin>"
 
 -- =====================================================================
--- Small helpers
+-- Byte-buffer marshalling (the only code that touches raw pointers)
 -- =====================================================================
--- Build a Data of pLen zero bytes for the shim to fill in place. See the
--- marshalling note in the header: this is one of the three Phase-0-sensitive
--- spots. (numToByte/byteToNum are the engine's byte<->number primitives.)
-private handler makeBuffer(in pLen as Integer) returns Data
-   variable tBuf as Data
-   put the empty data into tBuf
-   if pLen <= 0 then
-      return tBuf
+-- One reusable OUTPUT block, grown on demand. The capacity (0 until the first
+-- allocation) doubles as the "is it allocated?" flag, so an unset Pointer is
+-- never read. It persists for the process: there is no library-unload hook to
+-- free it at, and reuse keeps the build/parse hot path allocation-free.
+variable sScratchPtr as Pointer
+variable sScratchCap as Integer
+
+private handler ensureScratch(in pNeed as Integer)
+   variable tOk as Boolean
+   if sScratchCap >= pNeed then
+      return
    end if
-   variable tZero as Data
-   put the byte with code (0) into tZero
-   variable i as Integer
-   repeat with i from 1 up to pLen
-      put tZero after tBuf
+   if sScratchCap > 0 then
+      unsafe
+         MCMemoryDeallocate(sScratchPtr)
+      end unsafe
+      put 0 into sScratchCap
+   end if
+   put false into tOk
+   unsafe
+      put MCMemoryAllocate(pNeed, sScratchPtr) into tOk
+   end unsafe
+   if not tOk then
+      throw "osc: failed to allocate a scratch buffer"
+   end if
+   put pNeed into sScratchCap
+end handler
+
+-- Copy the first pLen bytes the shim wrote into the scratch block out as Data.
+private handler scratchToData(in pLen as Integer) returns Data
+   variable tData as Data
+   variable tOk as Boolean
+   put the empty data into tData
+   if pLen <= 0 then
+      return tData
+   end if
+   unsafe
+      put MCDataCreateWithBytes(sScratchPtr, pLen, tData) into tOk
+   end unsafe
+   if not tOk then
+      return the empty data
+   end if
+   return tData
+end handler
+
+-- The read-only pointer to an INPUT Data's bytes. Callers pass it with `the
+-- number of bytes in` that Data and keep the Data alive across the call (it is
+-- held by their own variable/parameter, so it is).
+private handler dataPtr(in pData as Data) returns Pointer
+   variable tPtr as Pointer
+   unsafe
+      put MCDataGetBytePtr(pData) into tPtr
+   end unsafe
+   return tPtr
+end handler
+
+-- Decode the first pLen bytes of the scratch block as UTF-8 text.
+private handler scratchText(in pLen as Integer) returns String
+   variable tData as Data
+   variable tStr as String
+   variable tOk as Boolean
+   put the empty string into tStr
+   if pLen <= 0 then
+      return tStr
+   end if
+   put scratchToData(pLen) into tData
+   unsafe
+      put MCStringDecode(tData, 4, false, tStr) into tOk
+   end unsafe
+   if not tOk then
+      return the empty string
+   end if
+   return tStr
+end handler
+
+-- Which caller-buffer string getter shimText calls (literal, declared before use).
+private constant kTxtAddress is 1
+private constant kTxtTypetag is 2
+private constant kTxtArgString is 3
+private constant kTxtArgInt64 is 4
+private constant kTxtTimetag is 5
+private constant kTxtError is 6
+
+-- Fetch one string from the shim through its caller-buffer contract: the call
+-- returns bytes written (>= 0), or -needed when the buffer is too small (grow
+-- once and retry). A negative that already fits (osc_arg_string's -1 for "not a
+-- string") or a bad handle yields empty -- never a throw, and never a C string
+-- the engine would free.
+private handler shimText(in pWhich as Integer, in pH as Integer, in pIndex as Integer) returns String
+   variable tRc as Integer
+   variable tTry as Integer
+   variable tNeed as Integer
+   put 256 into tNeed
+   repeat with tTry from 1 up to 2
+      ensureScratch(tNeed)
+      unsafe
+         if pWhich is kTxtAddress then
+            put _address(pH, sScratchPtr, sScratchCap) into tRc
+         else if pWhich is kTxtTypetag then
+            put _typetag(pH, sScratchPtr, sScratchCap) into tRc
+         else if pWhich is kTxtArgString then
+            put _arg_string(pH, pIndex, sScratchPtr, sScratchCap) into tRc
+         else if pWhich is kTxtArgInt64 then
+            put _arg_int64_str(pH, pIndex, sScratchPtr, sScratchCap) into tRc
+         else if pWhich is kTxtTimetag then
+            put _bundle_timetag_str(pH, sScratchPtr, sScratchCap) into tRc
+         else
+            put _last_error(sScratchPtr, sScratchCap) into tRc
+         end if
+      end unsafe
+      if tRc >= 0 then
+         return scratchText(tRc)
+      end if
+      if -tRc <= sScratchCap then
+         return the empty string
+      end if
+      put -tRc into tNeed
    end repeat
-   return tBuf
+   return the empty string
 end handler
 
 -- =====================================================================
@@ -152,40 +286,65 @@ end handler
 -- =====================================================================
 -- Public API: building
 -- =====================================================================
+-- Normalize a scalar arg value to the String the shim parses. The engine hands a
+-- script value across as EITHER a Number (e.g. the integer -42) or a String
+-- (e.g. "0.5"), and `put <Number> into <String>` throws -- so branch on the
+-- value's runtime type (com.livecode.type's `is a number` / `is a string`, both
+-- present on the 9.6.3 floor) and format numbers explicitly. Anything else (an
+-- Array, a Boolean, nothing) is not a valid scalar: return false, fail the build.
+private handler argText(in pValue as optional any, out rText as String) returns Boolean
+   if pValue is a string then
+      put pValue into rText
+      return true
+   end if
+   if pValue is a number then
+      put pValue formatted as string into rText
+      return true
+   end if
+   put the empty string into rText
+   return false
+end handler
+
 -- Append one [type, value] pair to an open builder handle.
-private handler addArg(in pH as Integer, in pType as String, in pValue as any) returns Boolean
+private handler addArg(in pH as Integer, in pType as String, in pValue as optional any) returns Boolean
    variable tStr as String
    variable tData as Data
    variable tOk as Boolean
    put true into tOk
-   -- Every numeric value crosses to C as a decimal STRING, which C parses. The
-   -- caller MUST pass numeric/string values as Strings: LCB cannot introspect an
-   -- `any` or convert a Number -> String (no type test, no try/catch -- see the
-   -- LCB Language Reference), so `put pValue into tStr` only succeeds when pValue
-   -- already IS a String. The script helpers (scAddArg / stAddArg) guarantee this
-   -- by forcing every non-blob value through `& empty` before it enters the list.
+   -- Every numeric value crosses to C as a decimal STRING, which C parses
+   -- (argText normalizes Number-or-String). int64 ("h") and timetag ("t") values
+   -- must be passed as decimal Strings by the caller: a script number is a
+   -- double, so a 64-bit value would already have lost precision.
+   if pType is "b" then
+      -- A blob must be Data (a String has no defined byte encoding here).
+      if not (pValue is a data) then
+         return false
+      end if
+      put pValue into tData
+   else if pType is not "T" and pType is not "F" and pType is not "N" and pType is not "I" then
+      if not argText(pValue, tStr) then
+         return false
+      end if
+   end if
    unsafe
       if pType is "i" then
-         put pValue into tStr
          _build_add_int32_str(pH, tStr)
       else if pType is "f" then
-         put pValue into tStr
          _build_add_float_str(pH, tStr)
       else if pType is "d" then
-         put pValue into tStr
          _build_add_double_str(pH, tStr)
       else if pType is "s" then
-         put pValue into tStr
          _build_add_string(pH, tStr)
       else if pType is "h" then
-         put pValue into tStr
          _build_add_int64_str(pH, tStr)
       else if pType is "t" then
-         put pValue into tStr
          _build_add_timetag_str(pH, tStr)
       else if pType is "b" then
-         put pValue into tData
-         _build_add_blob(pH, tData, the number of bytes in tData)
+         if the number of bytes in tData > 0 then
+            _build_add_blob(pH, dataPtr(tData), the number of bytes in tData)
+         else
+            _build_add_blob(pH, nothing, 0)
+         end if
       else if pType is "T" then
          _build_add_true(pH)
       else if pType is "F" then
@@ -217,27 +376,26 @@ private handler finishToData(in pH as Integer, in pKind as String) returns Data
    end if
    variable tCap as Integer
    put -tNeed into tCap
-   variable tBuf as Data
-   put makeBuffer(tCap) into tBuf
+   ensureScratch(tCap)
    variable tWrote as Integer
    unsafe
       if pKind is "bundle" then
-         put _bundle_finish(pH, tBuf, tCap) into tWrote
+         put _bundle_finish(pH, sScratchPtr, tCap) into tWrote
       else
-         put _build_finish(pH, tBuf, tCap) into tWrote
+         put _build_finish(pH, sScratchPtr, tCap) into tWrote
       end if
    end unsafe
-   if tWrote <= 0 then
-      return the empty data
-   end if
-   return byte 1 to tWrote of tBuf
+   return scratchToData(tWrote)
 end handler
 
 -- oscBuildMessage(pAddress, pArgs) -> Data
 --   pArgs is a FLAT list alternating type, value, type, value, ... -- e.g. the
 --   elements "i", 3, "f", 0.5, "s", "hi". The scAddArg helper (in
 --   examples/showcontrol-helpers.livecodescript) builds exactly this for you.
---   Types: i f s b (Data) h t (decimal String) d  T F N I (no value -- pass empty).
+--   Types: i f d s (a Number or a String) b (Data) h t (decimal String)
+--   T F N I (no value -- pass empty, or leave a final one dangling).
+--   A value of the wrong kind (an Array, a Boolean, a String blob), an unknown
+--   type code, or a trailing value type with no value builds NOTHING (empty Data).
 --   Why flat and NOT a list of [type, value] pairs: a nested LiveCode Script array
 --   does not survive the Script->LCB boundary as a list-of-lists -- the inner pair
 --   arrives as an Array, not a List -- so we flatten to scalars, which cross cleanly.
@@ -251,8 +409,8 @@ public handler oscBuildMessage(in pAddress as String, in pArgs as List) returns 
       return the empty data
    end if
    -- Walk the flat list two elements at a time: odd element = type code, even = value.
-   -- tType is carried as 'any' (not String) so it binds to addArg's String parameter
-   -- exactly the way the original list-element value did -- a coercion proven to work.
+   -- tType is carried as 'any' and bound to addArg's String parameter (a type code
+   -- is always a String, so the coercion holds).
    variable tElem as any
    variable tType as any
    variable tHaveType as Boolean
@@ -273,6 +431,18 @@ public handler oscBuildMessage(in pAddress as String, in pArgs as List) returns 
          end if
       end if
    end repeat
+   -- A trailing type with no value: natural for the no-value types (T F N I),
+   -- so accept it; for a value type it is a malformed list, so fail the build
+   -- (addArg rejects `nothing` as a value) instead of silently dropping the arg.
+   if tHaveType then
+      put addArg(tH, tType, nothing) into tArgOk
+      if not tArgOk then
+         unsafe
+            _build_free(tH)
+         end unsafe
+         return the empty data
+      end if
+   end if
    variable tResult as Data
    put finishToData(tH, "message") into tResult
    unsafe
@@ -293,10 +463,23 @@ public handler oscBuildBundle(in pTimetag as String, in pMessages as List) retur
    if tH is 0 then
       return the empty data
    end if
+   -- Each element must be a finished message (Data). A non-Data element, or an
+   -- empty one, fails the whole bundle quietly (the shim marks the builder bad, so
+   -- finish returns empty and oscLastError says why) instead of throwing into script.
+   variable tElem as optional any
    variable tMsg as Data
-   repeat for each element tMsg in pMessages
+   repeat for each element tElem in pMessages
+      if tElem is a data then
+         put tElem into tMsg
+      else
+         put the empty data into tMsg
+      end if
       unsafe
-         _bundle_add_message(tH, tMsg, the number of bytes in tMsg)
+         if the number of bytes in tMsg > 0 then
+            _bundle_add_message(tH, dataPtr(tMsg), the number of bytes in tMsg)
+         else
+            _bundle_add_message(tH, nothing, 0)
+         end if
       end unsafe
    end repeat
    variable tResult as Data
@@ -335,20 +518,11 @@ private handler readArg(in pH as Integer, in pIndex as Integer) returns any
       end unsafe
       return tNum
    else if tType is 115 then   -- 's'
-      unsafe
-         put _arg_string_z(pH, pIndex) into tStr
-      end unsafe
-      return tStr
+      return shimText(kTxtArgString, pH, pIndex)
    else if tType is 104 then   -- 'h' int64
-      unsafe
-         put _arg_int64_z(pH, pIndex) into tStr
-      end unsafe
-      return tStr
-   else if tType is 116 then   -- 't' timetag (LCB has no 'or', so a separate branch)
-      unsafe
-         put _arg_int64_z(pH, pIndex) into tStr
-      end unsafe
-      return tStr
+      return shimText(kTxtArgInt64, pH, pIndex)
+   else if tType is 116 then   -- 't' timetag (unsigned NTP-64, also a decimal string)
+      return shimText(kTxtArgInt64, pH, pIndex)
    else if tType is 98 then    -- 'b' blob -> Data
       return readBlob(pH, pIndex)
    else if tType is 84 then    -- 'T'
@@ -369,16 +543,12 @@ private handler readBlob(in pH as Integer, in pIndex as Integer) returns Data
    end if
    variable tCap as Integer
    put -tNeed into tCap
-   variable tBuf as Data
-   put makeBuffer(tCap) into tBuf
+   ensureScratch(tCap)
    variable tGot as Integer
    unsafe
-      put _arg_blob(pH, pIndex, tBuf, tCap) into tGot
+      put _arg_blob(pH, pIndex, sScratchPtr, tCap) into tGot
    end unsafe
-   if tGot <= 0 then
-      return the empty data
-   end if
-   return byte 1 to tGot of tBuf
+   return scratchToData(tGot)
 end handler
 
 -- Build the script-facing Array for one parsed message handle.
@@ -386,10 +556,8 @@ private handler messageArray(in pH as Integer) returns Array
    variable tArr as Array
    variable tAddr as String
    variable tTags as String
-   unsafe
-      put _address_z(pH) into tAddr
-      put _typetag_z(pH) into tTags
-   end unsafe
+   put shimText(kTxtAddress, pH, 0) into tAddr
+   put shimText(kTxtTypetag, pH, 0) into tTags
    put false into tArr["isBundle"]
    put tAddr into tArr["address"]
    put tTags into tArr["types"]
@@ -417,7 +585,11 @@ public handler oscParse(in pData as Data) returns Array
    checkABI()
    variable tH as Integer
    unsafe
-      put _parse(pData, the number of bytes in pData) into tH
+      if the number of bytes in pData > 0 then
+         put _parse(dataPtr(pData), the number of bytes in pData) into tH
+      else
+         put _parse(nothing, 0) into tH       -- the shim reports "datagram too short"
+      end if
    end unsafe
    if tH is 0 then
       variable tErr as Array
@@ -446,9 +618,7 @@ private handler buildBundleArray(in pH as Integer) returns Array
    variable tArr as Array
    put true into tArr["isBundle"]
    variable tTag as String
-   unsafe
-      put _bundle_timetag_z(pH) into tTag
-   end unsafe
+   put shimText(kTxtTimetag, pH, 0) into tTag
    put tTag into tArr["timetag"]
    variable tCount as Integer
    unsafe
@@ -494,11 +664,7 @@ public handler oscMatch(in pPattern as String, in pAddress as String) returns Bo
 end handler
 
 public handler oscLastError() returns String
-   variable tErr as String
-   unsafe
-      put _error_z() into tErr
-   end unsafe
-   return tErr
+   return shimText(kTxtError, 0, 0)
 end handler
 
 -- Linux helper: preload osc.so by absolute path (no /usr/lib, no sudo, no
@@ -516,11 +682,19 @@ public handler oscLoadNativeLib(in pPath as String) returns Integer
 end handler
 
 public handler oscLoadNativeLibError() returns String
-   variable tErr as optional String
+   variable tPtr as optional Pointer
+   variable tErr as String
+   variable tOk as Boolean
    unsafe
-      put _dlerror() into tErr
+      put _dlerror() into tPtr
    end unsafe
-   if tErr is nothing then
+   if tPtr is nothing then
+      return ""
+   end if
+   unsafe
+      put MCStringCreateWithCString(tPtr, tErr) into tOk
+   end unsafe
+   if not tOk then
       return ""
    end if
    return tErr

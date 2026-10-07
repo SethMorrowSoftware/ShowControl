@@ -61,8 +61,11 @@ the wire format; the extension is a pure codec over LiveCode's UDP sockets.
 ### `oscBuildMessage(pAddress, pArgs)` -> Data
 
 Build a single OSC message. `pAddress` is the OSC address pattern (a string such
-as `/1/fader1`); `pArgs` is a sequence of `[type, value]` pairs. For the no-value
-types (`T`/`F`/`N`/`I`) supply an (ignored) value, e.g. empty. Returns the complete
+as `/1/fader1`); `pArgs` is a flat sequence of type, value, type, value, ... Numeric values
+(`i f d`, and `s`) may be numbers or strings -- the binding normalizes either; pass
+`h` / `t` (64-bit) as decimal **strings**, and `b` as binary `Data`. For the
+no-value types (`T`/`F`/`N`/`I`) supply an (ignored) value, e.g. empty -- or leave a
+final one with no value at all. Returns the complete
 OSC datagram as `Data`, ready to `write ... to socket`.
 
 > **Building `pArgs` in LiveCode Script.** xTalk has **no `[...]` list-literal
@@ -86,14 +89,16 @@ OSC datagram as `Data`, ready to `write ... to socket`.
 > List). `oscBuildMessage` walks the flat list two elements at a time. (Inside a
 > `.lcb`, the `[...]` literal *is* valid - this caveat is only for LiveCode Script.)
 
-**Fails** (returns empty, sets last-error) on a null/over-long address, an unknown
-type code, or a value that cannot be coerced to the declared type.
+**Fails** (returns empty) on a null/over-long address, an unknown type code, a
+value of the wrong kind (an array, a boolean, a string where a blob is declared),
+or a trailing value type with no value.
 
 ```
 local tArgs
 scAddArg tArgs, "i", 60
 scAddArg tArgs, "f", 0.8
 put oscBuildMessage("/synth/note", tArgs) into tData
+open datagram socket to "127.0.0.1:7000"   -- once: the engine writes only to open sockets
 write tData to socket "127.0.0.1:7000"
 ```
 
@@ -116,6 +121,7 @@ scAddArg tArgs, "f", 2.0
 put oscBuildMessage("/b", tArgs) into tB
 put tA into tMsgs[1]
 put tB into tMsgs[2]
+open datagram socket to "127.0.0.1:7000"   -- once
 write oscBuildBundle("1", tMsgs) to socket "127.0.0.1:7000"
 ```
 
@@ -151,7 +157,8 @@ interpret them).
 otherwise malformed datagram.
 
 ```
-on oscDataReceived pSocket, pData
+-- accept datagram connections on port 9000 with message "oscDataReceived"
+on oscDataReceived pSender, pData
    put oscParse(pData) into tMsg
    if tMsg["isBundle"] then
       repeat for each element tSub in tMsg["messages"]
@@ -160,7 +167,6 @@ on oscDataReceived pSocket, pData
    else
       handleOneMessage tMsg
    end if
-   read from socket pSocket with message "oscDataReceived"
 end oscDataReceived
 
 on handleOneMessage tMsg
@@ -231,7 +237,8 @@ every later call, and `midiClose` it when done.
 
 **Fails** (returns `0`, sets last-error) on an out-of-range index, or when no MIDI
 backend is available, or - for virtual ports - on Windows (WinMM has no virtual
-ports). After `midiClose`, the handle is dead and every call on it is a no-op.
+ports; RtMidi only warns there, so the shim refuses explicitly and the error names
+the fix: a loopback driver such as loopMIDI). After `midiClose`, the handle is dead and every call on it is a no-op.
 
 ```
 put midiOpenInput(0) into tIn
@@ -372,6 +379,7 @@ is zero-padded, and an odd length is padded up to even.
 
 ```
 put numToByte(255) into tCh -- channel 1 full
+open datagram socket to "2.0.0.10:6454"   -- once
 write artnetBuildDmx(0, tCh) to socket "2.0.0.10:6454"
 ```
 
@@ -394,12 +402,12 @@ Parse a received ArtDmx packet (`Data`) into an Array:
 packet (bad ID, wrong OpCode, inconsistent length).
 
 ```
-on dmxArrived pSocket, pData
+-- accept datagram connections on port 6454 with message "dmxArrived"
+on dmxArrived pSender, pData
    put artnetParseDmx(pData) into tDmx
    if tDmx["opcode"] is "ArtDmx" and tDmx["universe"] is 0 then
       put byteToNum(byte 1 of tDmx["channels"]) into tDimmer -- channel 1
    end if
-   read from socket pSocket with message "dmxArrived"
 end dmxArrived
 ```
 
@@ -410,6 +418,8 @@ Build an **ArtPoll** discovery datagram (no arguments). Broadcast it to
 `artnetParseReply`.
 
 ```
+set the allowDatagramBroadcasts to true
+open datagram socket to "255.255.255.255:6454"
 write artnetBuildPoll() to socket "255.255.255.255:6454"
 ```
 
@@ -431,12 +441,12 @@ out of scope for this cut; see README S7.) **Fails** (returns empty, sets
 last-error) if the bytes are not a valid ArtPollReply.
 
 ```
-on replyArrived pSocket, pData
+-- accept datagram connections on port 6454 with message "replyArrived"
+on replyArrived pSender, pData
    put artnetParseReply(pData) into tNode
    if tNode["opcode"] is "ArtPollReply" then
       put tNode["longName"] && "(" & tNode["ip"] & ")" & return after field "Nodes"
    end if
-   read from socket pSocket with message "replyArrived"
 end replyArrived
 ```
 
@@ -445,7 +455,7 @@ end replyArrived
 This convenience verb ships in `examples/showcontrol-helpers.livecodescript` (not
 the extension itself - pure LCB cannot open sockets). It wraps build-plus-write:
 it builds an ArtDmx packet for `pUniverse` from `pChannels` and writes it to
-`pHost:6454`. Equivalent to
+`pHost:6454`. Equivalent to opening `pHost:6454` once (`scEnsureDatagramSocket`) and then
 `write artnetBuildDmx(pUniverse, pChannels) to socket (pHost & ":6454")`. Its
 failure behaviour is whatever the engine's `write` does - it does not itself set
 the Art-Net last-error (`artnetBuildDmx` returns empty on a bad universe as above).
@@ -463,11 +473,17 @@ succeeded).
 
 ## Notes and gotchas
 
-**Sockets are yours (OSC, Art-Net).** The extensions never open or read a socket - 
-they only build and parse `Data`. You `accept datagram connections on port ...`,
-`write ... to socket "host:port"`, and `read from socket ... with message ...` (and
-re-`read` to keep listening). Inbound bytes are `Data`; pass them straight to
-`oscParse` / `artnetParseDmx` / `artnetParseReply`. See the worked sockets in
+**Sockets are yours (OSC, Art-Net).** The extensions never open or read a socket -
+they only build and parse `Data`. You `accept datagram connections on port P with
+message "m"` and handle `on m pSender, pData` -- called **once per datagram**, sender
+first, no `read` needed -- and you `open datagram socket to "host:port"` **before**
+writing to it (the engine silently sends nothing to a socket that was never opened;
+the helpers' `scEnsureDatagramSocket` does this). To receive *replies* on a socket you
+opened (say, from the node you sent an ArtPoll to), follow the open with
+`read from socket "host:port" with message "m"` -- not `open ... with message`, whose
+message is the open-complete callback. Inbound bytes are `Data`; pass them
+straight to `oscParse` / `artnetParseDmx` / `artnetParseReply`. Both behaviours are
+pinned by the CI socket suite (`tests/lcs/udp_test`); see
 [getting-started.md](getting-started.md).
 
 **MIDI is polled, not pushed.** Run a timer loop that calls `midiPoll` and

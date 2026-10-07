@@ -1,5 +1,12 @@
 # Testing ShowControl in OXT without hardware
 
+> Everything on this page also runs **automatically and headlessly** in CI -- the
+> self-test included -- see [testing.md](testing.md). This page is for running it by
+> hand inside the IDE, and for the visual monitor. For the other end of the wire
+> without any gear, use the virtual peers in [`tools/sim/`](../tools/sim): a
+> virtual Art-Net node (`python3 tools/sim/artnet_node.py`) and an OSC peer
+> (`python3 tools/sim/osc_peer.py --ack`).
+
 You can validate almost the entire stack inside OpenXTalk with **no controllers,
 DAWs, or DMX nodes** — by looping each extension's output back through its own
 input. This is the fastest way to confirm the extensions loaded, the FFI
@@ -58,6 +65,8 @@ loopback results append a moment later as the datagrams arrive.
 Expected on a typical desktop: all Tier 1 + Tier 3 checks pass; the two Tier 2
 loopback lines report PASS. On **Windows**, the virtual-MIDI-output check reports
 "unavailable" instead of failing — WinMM has no virtual ports, which is correct.
+(RtMidi only *warns* about that, so older builds of the shim returned a handle that
+silently sent nowhere; the shim now refuses with a message that names loopMIDI.)
 
 > The self-test prints small diagnostics (e.g. the element count of a parsed `args`
 > list). If an `args[n]` access ever reads oddly in your engine build, those lines

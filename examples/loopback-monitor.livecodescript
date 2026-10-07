@@ -30,7 +30,7 @@ command scStartMonitor
    put 6455 into sMonPort       -- a test port (not the real 6454) to avoid clashes
    scBuildUI
    try
-      close socket ("0.0.0.0:" & sMonPort)
+      close socket sMonPort   -- an accepted socket is named by its port alone
    end try
    accept datagram connections on port sMonPort with message "scMonArrived"
    scLog "Monitor started. Listening on udp:" & sMonPort & ". Click Sweep, or Send OSC."
@@ -39,7 +39,7 @@ end scStartMonitor
 command scStopMonitor
    put false into sSweepOn
    try
-      close socket ("0.0.0.0:" & sMonPort)
+      close socket sMonPort   -- an accepted socket is named by its port alone
    end try
    scLog "Monitor stopped."
 end scStopMonitor
@@ -102,6 +102,7 @@ command scSweepTick
       put numToByte(v) after tChannels
    end repeat
    -- Send it to ourselves; it comes back in scMonArrived and repaints the rig.
+   scMonEnsureSocket
    write artnetBuildDmx(0, tChannels) to socket ("127.0.0.1:" & sMonPort)
    add 8 to sSweepVal
    if sSweepVal > 255 then put 0 into sSweepVal
@@ -130,6 +131,7 @@ command scSendOsc
    -- string (the field's text), which is exactly what type "s" wants.
    put "s" into tArgs[1]
    put tText into tArgs[2]
+   scMonEnsureSocket
    write oscBuildMessage("/monitor/echo", tArgs) to socket ("127.0.0.1:" & sMonPort)
 end scSendOsc
 
@@ -183,3 +185,12 @@ private command scLog pText
       put pText & return after field "scMonLog"
    end try
 end scLog
+
+-- The engine only writes to an OPEN socket: writing to an unopened "host:port"
+-- name sets the result to "socket is not open" and sends nothing. Open the
+-- loopback sender once.
+private command scMonEnsureSocket
+   if ("127.0.0.1:" & sMonPort) is not among the lines of the openSockets then
+      open datagram socket to ("127.0.0.1:" & sMonPort)
+   end if
+end scMonEnsureSocket
