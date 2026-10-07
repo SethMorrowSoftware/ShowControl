@@ -50,6 +50,9 @@ def main():
     run("Art-Net golden packets", [PY, "tests/artnet_golden_test.py"], results)
     run("virtual peers self-test", [PY, "tests/simulators_test.py"], results)
     run("vectors.h is fresh", [PY, "tools/gen_vectors.py", "--check"], results)
+    run("binary installer selftest", [PY, "tools/install-release-binaries.py", "--selftest"], results)
+    run("binary freshness fixtures", [PY, "tests/binary_freshness_test.py"], results)
+    run("COMMITTED binaries are fresh + portable", [PY, "tools/check-binary-freshness.py"], results)
 
     built = True
     if not a.skip_build:

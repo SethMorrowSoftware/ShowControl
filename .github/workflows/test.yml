@@ -68,6 +68,8 @@ jobs:
           python tools/check-livecodescript.py
       - name: The binary installer refuses what it must (its own selftest)
         run: python tools/install-release-binaries.py --selftest
+      - name: Every freshness-gate leg can still fail (fixtures)
+        run: python tests/binary_freshness_test.py
       - name: The COMMITTED binaries are fresh, portable and match their manifests
         run: |
           python tools/package-extension.py --check
