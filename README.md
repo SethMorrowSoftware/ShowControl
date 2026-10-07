@@ -47,21 +47,21 @@ layer, because "what is actually verified" matters more than a version number:
 
 | Layer | What it is | Verification state |
 |-------|------------|--------------------|
-| **C shims** (`osc`, `midi`) | the locked C ABI over tinyosc / RtMidi | **Verified.** The OSC shim passes 61 assertions under **AddressSanitizer + UndefinedBehaviorSanitizer + float-cast-overflow** (`-fno-sanitize-recover=all`), including malformed-datagram fuzzing. The MIDI shim's drain/stash/port-name logic is exercised the same way. CI builds and tests on Linux, macOS (universal), and Windows (x64 + x86). |
-| **Art-Net wire format** | the ArtDmx / ArtPoll byte layout | **Verified.** 18 byte-exact golden-packet assertions pin the mixed-endianness layout (`tests/artnet_golden_test.py`). |
-| **LCB bindings** (`.lcb`) | the script-facing `library` wrappers | **Statically gated, runtime-pending.** OXT is a GUI runtime with no headless compiler, so the bindings are checked by `tools/check-livecodescript.py` (smart quotes, handler/control balance, module terminator, LiveCode-Script-isms) and audited by hand. They still need an **OXT runtime pass** — see the [Phase-0 FFI spike](docs/phase0-ffi-spike.md). |
-| **Hardware interop** | TouchOSC, DAWs, DMX nodes | **Not yet run.** No external hardware available at the time of writing; real-device testing ([`docs/project-plan.md` §10.2](docs/project-plan.md)) is the next gate. |
+| **C shims** (`osc`, `midi`) | the locked C ABI over tinyosc / RtMidi | **Verified.** Smoke, mock-MIDI and shared-vector suites under **ASan + UBSan + float-cast-overflow** (`-fno-sanitize-recover=all`); `osc_parse` is **fuzzed** (a deterministic mutation fuzzer in ctest, libFuzzer in CI). CI builds on Linux, macOS (universal) and Windows (x64 + x86). |
+| **Wire formats** | OSC / Art-Net / MIDI bytes | **Verified** against shared vectors ([`tests/vectors/`](tests/vectors)) by three independent implementations: clean-room spec codecs + the third-party **python-osc**, the C shim, and the LCB bindings. |
+| **LCB bindings** (`.lcb`) | the script-facing `library` wrappers | **Compiled and run in CI** with `lc-compile` + `lc-run` on Linux, Windows and macOS — every public handler, the FFI marshalling, MIDI end to end through a mock RtMidi library ([`docs/testing.md`](docs/testing.md)). |
+| **LiveCode Script layer** | the helpers, examples, Script↔LCB boundary | **Run in a real engine in CI** (standalone, `-ui`): an in-engine compile gate over every script, the boundary, the MIDI dispatcher, the shipped self-test, real UDP through the engine's sockets, and interop with independent virtual peers. |
+| **Hardware interop** | TouchOSC, DAWs, DMX nodes | **Not yet run on real gear.** Interop with spec-derived virtual peers ([`tools/sim/`](tools/sim)) is automated; a Wireshark check on the first real rig ([`docs/project-plan.md` §10.2](docs/project-plan.md)) is the remaining gate. |
 
-**Bottom line:** the native, memory-safety-critical core is proven under
-sanitizers; the script bindings compile-gate clean and have been audited but want
-a real OXT compile-and-run; no hardware has been driven yet. Treat it as a
-solid, reviewable foundation ready for that first OXT pass — not as battle-tested
-production software.
+**Bottom line:** every layer now runs automatically with no hardware, and the
+first full runs found and fixed real bugs (a remote OSC out-of-bounds read, the
+`Data`→`Pointer` FFI marshalling, engine-freed string returns, a mangling MIDI
+dispatcher, wrong UDP callback/send patterns — see the [CHANGELOG](CHANGELOG.md)).
+What remains is driving specific third-party gear.
 
-> The one empirical unknown for the OXT pass is how a LiveCode `Data` crosses the
-> FFI to a foreign `Pointer`. It is isolated to a handful of LCB helpers and has a
-> documented fallback (hex-over-string). Run [`docs/phase0-ffi-spike.md`](docs/phase0-ffi-spike.md)
-> **first**; the C ABI is stable regardless of how it resolves.
+> The Phase-0 FFI unknown is **resolved**: a `Data` does *not* bridge to a foreign
+> `Pointer`. The bindings use the engine's `MCDataGetBytePtr` / `MCMemoryAllocate`
+> / `MCDataCreateWithBytes` instead ([`docs/phase0-ffi-spike.md`](docs/phase0-ffi-spike.md)).
 
 ## Repository layout
 
@@ -80,17 +80,28 @@ ShowControl/
 │   │   └── artnet.lcb            pure-LCB binding (library org.openxtalk.library.artnet)
 │   └── third_party/tinyosc/      vendored tinyosc (ISC) — built into the osc lib
 ├── tests/
-│   ├── osc_smoke_test.c          round-trip + fuzz, runs under ASan/UBSan
+│   ├── osc_smoke_test.c          round-trip + malformed input, runs under ASan/UBSan
+│   ├── osc_vectors_test.c        the shared vectors through the C shim
 │   ├── midi_smoke_test.c         enumerate/open/drain/handle-safety, headless-safe
-│   └── artnet_golden_test.py     byte-exact golden packets (the endianness spec)
+│   ├── midi_mock_smoke_test.c    drain/stash/loopback against the RtMidi mock
+│   ├── mock/                     rtmidi_mock.c: the RtMidi test double (+ build/mock/midi)
+│   ├── fuzz/osc_fuzz.c           mutation fuzzer (ctest) / libFuzzer entry (CI)
+│   ├── vectors/                  ONE source of truth for the wire formats (+ generated vectors.h)
+│   ├── lcb/                      LCB test modules, run under lc-run
+│   ├── lcs/                      LiveCode Script test stacks + runner, run in the engine (-ui)
+│   └── *_test.py                 vectors reference, Art-Net goldens, peers, checker fixtures
 ├── tools/
+│   ├── run-lcb-tests.py          compile + run the LCB suites headlessly (lc-compile / lc-run)
+│   ├── run-lcs-tests.py          run the Script suites in the standalone engine (-ui)
+│   ├── gen_vectors.py            vectors -> vectors.h / the LCB vectors module / a fuzz corpus
+│   ├── sim/                      virtual Art-Net node + OSC peer (clean-room codecs)
 │   ├── check-livecodescript.py   static gate for .lcb + .livecodescript
 │   └── package-extension.py      refresh the committed code/<plat>/ trees
 ├── examples/                     LiveCode Script helpers + a wired-together demo
 ├── docs/                         architecture, building, getting-started, api-reference,
-│                                 phase0-ffi-spike, project-plan
-├── CMakeLists.txt                builds the osc + midi native libraries
-└── .github/workflows/build.yml   static + golden + ASan/UBSan gate, then the build matrix
+│                                 testing, testing-in-oxt, phase0-ffi-spike, project-plan
+├── CMakeLists.txt                builds the osc + midi native libraries (+ tests, mock, fuzzer)
+└── .github/workflows/            build.yml (shims, ASan/UBSan, release) + test.yml (headless suites)
 ```
 
 The native libraries ship **bundled inside each extension** at
@@ -172,17 +183,25 @@ ship as LiveCode Script in
 **OSC — receive a TouchOSC fader, send to Resolume:**
 
 ```
-on socketReceived pData, pHost
+on openCard
+   accept datagram connections on port 9000 with message "oscArrived"
+end openCard
+
+-- One call per datagram: (sender "host:port", data). No read needed.
+on oscArrived pSender, pData
    put oscParse(pData) into tMsg
    if tMsg["address"] is "/1/fader1" then
       set the thumbPosition of scrollbar "Volume" to (tMsg["args"][1]) * 100
    end if
-   read from socket pHost for 8192
-end socketReceived
+end oscArrived
 
 on mouseUp
    local tArgs                          -- build args by assignment: xTalk has no [...] literal
    scAddArg tArgs, "f", 0.75
+   -- the engine only writes to an OPEN socket (scOscSend does this for you)
+   if "127.0.0.1:7000" is not among the lines of the openSockets then
+      open datagram socket to "127.0.0.1:7000"
+   end if
    write oscBuildMessage("/composition/layers/1/video/opacity/values", tArgs) \
         to socket "127.0.0.1:7000"
 end mouseUp
@@ -206,7 +225,7 @@ end midiPollLoop
 ```
 on faderChanged
    put numToByte(the thumbPosition of me) into tChannels   -- channel 1
-   write artnetBuildDmx(0, tChannels) to socket "2.0.0.10:6454"
+   scArtnetSend "2.0.0.10", 0, tChannels   -- opens the socket once, then writes
 end faderChanged
 ```
 
@@ -232,8 +251,8 @@ pure LCB. The boundary at the bottom is a locked, flat C ABI.
 callback.** Invoking script from a foreign (non-main) thread is fragile and
 unsupported, so every inbound path avoids it:
 
-- **OSC / Art-Net inbound** ride the engine's own UDP sockets — datagrams arrive in
-  a normal `on socketReceived`; the extension only converts bytes ⇄ structured
+- **OSC / Art-Net inbound** ride the engine's own UDP sockets — each datagram arrives
+  as a normal message (`on oscArrived pSender, pData`); the extension only converts bytes ⇄ structured
   values. No thread, no callback, no queue of our own.
 - **MIDI inbound** is drained from RtMidi's internal FIFO by **polling** on a timer
   (`midiPoll`). RtMidi buffers and delta-time-stamps every message, so integrity
@@ -264,43 +283,40 @@ matrix, macOS signing/notarization, the `.def` note for 32-bit Windows — are i
 
 ## Testing & verification
 
-Because OXT can't compile or run `.lcb` headlessly, ShowControl pushes correctness
-into the layers that *can* be tested automatically, and gates the rest statically:
+Everything is tested automatically, **with no MIDI, DMX or OSC hardware and no
+display** — the C shims, the LCB bindings (compiled and run with `lc-compile` /
+`lc-run`), the LiveCode Script layer in a real engine (`-ui`), real UDP through
+the engine's sockets, and interop with independent virtual peers. Full guide:
+[`docs/testing.md`](docs/testing.md).
 
 ```sh
-# C shims + runtime smoke tests (the only automated runtime suite)
-ctest --test-dir build --output-on-failure
+# native shims, the mock MIDI library, C tests (smoke, vectors, mock, fuzzer)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON
+cmake --build build --config Release
+ctest --test-dir build --build-config Release --output-on-failure --no-tests=error
 
-# Always iterate the OSC shim under sanitizers — it parses untrusted network bytes
-gcc -std=c17 -Wall -Wextra -fsanitize=address,undefined,float-cast-overflow \
-  -fno-sanitize-recover=all -D_DEFAULT_SOURCE \
-  -Isrc/osc -Isrc/third_party/tinyosc \
-  src/osc/osc_shim.c src/third_party/tinyosc/tinyosc.c tests/osc_smoke_test.c -lm -o /tmp/osc && /tmp/osc
+# wire-format vectors (clean-room codecs + python-osc), virtual peers, static gates
+python3 tests/vectors_reference_test.py
+python3 tests/simulators_test.py
+python3 tests/checker_fixtures_test.py && python3 tools/check-livecodescript.py
 
-# Art-Net wire format (pure-Python reference + golden packets, runs anywhere)
-python3 tests/artnet_golden_test.py
-
-# Static gate for the script layer (.lcb + .livecodescript)
-python3 tools/check-livecodescript.py
+# the bindings under lc-run, then the Script layer in the engine (any OXT build folder)
+python3 tools/run-lcb-tests.py --oxt-bin /path/to/oxt/bin --build-dir build
+python3 tools/run-lcs-tests.py --oxt-bin /path/to/oxt/bin --build-dir build
 ```
 
-The OSC fuzz/round-trip suite, the Art-Net golden packets, and the ASan/UBSan gate
-run in CI on every push and PR ([`.github/workflows/build.yml`](.github/workflows/build.yml)),
-across Linux / macOS-universal / Windows. The sanitizer gate uses
-`-fno-sanitize-recover=all` so *any* memory or UB error fails the build instead of
-only printing — including `float-cast-overflow`, which is **not** in the default
-`undefined` group but is reachable from a hostile OSC float argument.
+CI ([`.github/workflows/test.yml`](.github/workflows/test.yml)) runs all of it on
+Linux, Windows and macOS against a pinned, checksum-verified OXT-Beyond release,
+with libFuzzer + ASan/UBSan on the OSC parser; [`build.yml`](.github/workflows/build.yml)
+keeps the sanitizer gate (`-fno-sanitize-recover=all`, `float-cast-overflow`
+included) and the build matrix. A suite that cannot run fails rather than skips.
 
-**Testing inside OXT — no hardware needed.** Loop each extension's output back
-through its own input to validate the whole stack with no controllers, DAWs, or DMX
-nodes. [`examples/selftest.livecodescript`](examples/selftest.livecodescript) is an
-automated pass/fail run across all three (build→parse round-trips, `oscMatch`,
-Art-Net golden bytes, the MIDI decoder, UDP loopback, port lifecycle);
-[`examples/loopback-monitor.livecodescript`](examples/loopback-monitor.livecodescript)
-is an interactive visual monitor whose "virtual DMX rig" lights up from looped-back
-Art-Net. Tier 1 of the self-test also doubles as the [Phase-0 FFI confirmation](docs/phase0-ffi-spike.md).
-Full how-to (including software MIDI loopback for a complete MIDI round-trip):
-[`docs/testing-in-oxt.md`](docs/testing-in-oxt.md).
+**Hand testing without hardware.** [`tools/sim/`](tools/sim) gives you the other
+end of the wire — a virtual Art-Net node (answers ArtPoll, shows each ArtDmx as a
+level meter) and an OSC peer (prints and acknowledges what it decoded). In OXT,
+[`examples/selftest.livecodescript`](examples/selftest.livecodescript) (also run
+in CI) and the visual [`examples/loopback-monitor.livecodescript`](examples/loopback-monitor.livecodescript)
+loop each extension back through itself — see [`docs/testing-in-oxt.md`](docs/testing-in-oxt.md).
 
 ## Design rules that keep this safe
 
@@ -358,6 +374,7 @@ Details and notice-retention requirements: [`THIRD-PARTY-NOTICES.md`](THIRD-PART
 | [`docs/api-reference.md`](docs/api-reference.md) | Every public handler, the `oscParse` Array and `midiPoll` record shapes, failure behavior, units. |
 | [`docs/architecture.md`](docs/architecture.md) | The three layers, why the shims exist, the no-callback rule, sockets-vs-polling, FFI marshalling, the ABI. |
 | [`docs/building.md`](docs/building.md) | Build the native libraries, run the C tests, package each extension, the platform/CPU/signing matrix. |
+| [`docs/testing.md`](docs/testing.md) | The automated, headless, hardware-free test suites: lc-run, the engine with `-ui`, the mock MIDI library, the virtual peers, the shared vectors, fuzzing, writing tests, and the engine facts they pin. |
 | [`docs/testing-in-oxt.md`](docs/testing-in-oxt.md) | Validate the whole stack inside OXT with **no hardware** — the automated self-test, the visual loopback monitor, and software MIDI loopback. |
 | [`docs/phase0-ffi-spike.md`](docs/phase0-ffi-spike.md) | The one empirical unknown for the OXT pass: `Data` ⇄ pointer marshalling, with a hex-transport fallback. |
 | [`docs/project-plan.md`](docs/project-plan.md) | The original strategy: target users, competitive positioning, showcase demos, milestones, risk register, roadmap. |

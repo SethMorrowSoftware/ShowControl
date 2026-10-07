@@ -1,5 +1,24 @@
 # Phase 0: the `Data` <-> pointer FFI spike
 
+> **RESOLVED (2026-10-06) -- and the expected answer was wrong.** Running the
+> bindings for the first time under the real LCB VM (`lc-run`, then the
+> standalone engine -- both headless, see [testing.md](testing.md)) showed that a
+> `Data` passed to a foreign `Pointer` parameter is **rejected**: "Value is not of
+> correct type for passing as argument". The LCB Language Reference says as much:
+> *no automatic bridging from Data or String to Pointer exists* -- a `Data`
+> marshals as an `MCDataRef`. The bindings now use the engine's own `<builtin>`
+> helpers, the idiom the xtalk-suite (TorrentXT) had already proven:
+>
+> * **input** buffers: `MCDataGetBytePtr(theData)` + `the number of bytes in theData`
+>   (an empty buffer as `nothing` through an `optional Pointer`);
+> * **output** buffers: a reusable block from `MCMemoryAllocate` (size `UIntSize`),
+>   filled by C, copied back with `MCDataCreateWithBytes`;
+> * **strings** out of C: through a caller buffer too -- a foreign handler must never
+>   *return* a `ZString*`, because the engine frees it.
+>
+> The spike below is kept as the record of the question; the automated suites
+> (`tools/run-lcb-tests.py`, `tools/run-lcs-tests.py`) now answer it on every CI run.
+
 This is the single empirical unknown the whole project is designed around. Run it
 **first**, in the target engine, before trusting the byte-buffer paths in
 `osc.lcb` / `midi.lcb`. Everything else (the C shims, their tests, the Art-Net
