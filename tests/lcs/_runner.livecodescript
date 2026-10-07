@@ -396,7 +396,12 @@ on scProbeSockets
    put TestPortBase() into tPort
    put empty into sProbeGot
    accept datagram connections on port tPort with message "scProbeArrived"
+   TestDiagnostic "accept: [" & the result & "]"
+   -- the engine only writes to an OPEN socket (exec-network.cpp)
+   open datagram socket to ("127.0.0.1:" & tPort)
+   TestDiagnostic "open: [" & the result & "]"
    write "showcontrol-probe" to socket ("127.0.0.1:" & tPort)
+   TestDiagnostic "write: [" & the result & "]"
    put the milliseconds + 3000 into tDeadline
    repeat until sProbeGot is not empty or the milliseconds > tDeadline
       wait 10 milliseconds with messages
@@ -404,6 +409,7 @@ on scProbeSockets
    TestAssert "engine delivers UDP to itself without a UI", sProbeGot is not empty
    try
       close socket tPort
+      close socket ("127.0.0.1:" & tPort)
    end try
 end scProbeSockets
 
