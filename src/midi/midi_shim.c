@@ -188,6 +188,17 @@ static int32_t open_port(int is_input, int32_t portIndex, const char *vname) {
         return 0;
     }
     if (vname) {
+        /* Windows MM (and RtMidi's dummy API) cannot create virtual ports, but
+         * RtMidi only raises a WARNING for it: `ok` stays true and the caller
+         * gets a live-looking handle that silently sends nowhere. The headless
+         * suite caught exactly that on Windows. Refuse it up front with a reason
+         * the script can show (the documented contract: 0 + midiLastError). */
+        enum RtMidiApi api = is_input ? rtmidi_in_get_current_api(d) : rtmidi_out_get_current_api(d);
+        if (api == RTMIDI_API_WINDOWS_MM || api == RTMIDI_API_RTMIDI_DUMMY) {
+            err_set("midi: this MIDI backend has no virtual ports (on Windows use a loopback driver such as loopMIDI)");
+            if (is_input) rtmidi_in_free(d); else rtmidi_out_free(d);
+            return 0;
+        }
         rtmidi_open_virtual_port(d, vname);
     } else {
         unsigned count = rtmidi_get_port_count(d);
@@ -267,7 +278,11 @@ static int emit_record(uint8_t *out, int32_t out_cap, int32_t *pos,
     return 1;
 }
 
-MIDI_API int32_t midi_in_drain(int32_t handle, uint8_t *out, int32_t out_cap, int32_t max_msgs) {
+/* The drain itself. Returns the record count and reports the bytes written via
+ * *bytes_out, so both public entry points share one implementation. */
+static int32_t drain_impl(int32_t handle, uint8_t *out, int32_t out_cap, int32_t max_msgs,
+                          int32_t *bytes_out) {
+    *bytes_out = 0;
     midi_port *mp = tbl_get(handle);
     if (!mp || !mp->is_input || !mp->ptr || !out) return 0;
 
@@ -321,7 +336,23 @@ MIDI_API int32_t midi_in_drain(int32_t handle, uint8_t *out, int32_t out_cap, in
         }
         count++;
     }
+    *bytes_out = pos;
     return count;
+}
+
+MIDI_API int32_t midi_in_drain(int32_t handle, uint8_t *out, int32_t out_cap, int32_t max_msgs) {
+    int32_t bytes;
+    return drain_impl(handle, out, out_cap, max_msgs, &bytes);
+}
+
+/* Same drain, but returns the BYTES written (records are self-delimiting). The
+ * LCB binding needs the byte length, not the count: it drains into a raw engine
+ * block (a Data does not bridge to a Pointer) and must copy exactly the written
+ * bytes back out with MCDataCreateWithBytes. ABI 2. */
+MIDI_API int32_t midi_in_drain_bytes(int32_t handle, uint8_t *out, int32_t out_cap, int32_t max_msgs) {
+    int32_t bytes;
+    (void) drain_impl(handle, out, out_cap, max_msgs, &bytes);
+    return bytes;
 }
 
 /* ---- output -------------------------------------------------------------- */
