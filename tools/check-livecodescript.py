@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Static gates for the ShowControl script layers (.lcb and .livecodescript).
 
-OXT / LiveCode is a GUI runtime: there is no headless way to compile or run the
-extension sources in CI or from an agent's sandbox. This script catches the
-mistakes that are statically catchable *before* a human compiles in OXT, bundled
-into one command.
+This is the FAST, dependency-free first line. Since the headless suites landed,
+the real compilers are in the loop too -- tools/run-lcb-tests.py compiles every
+.lcb with lc-compile and runs it under lc-run, and tools/run-lcs-tests.py asks a
+real engine to compile every .livecodescript -- so this script's job is to catch
+the cheap, known mistakes in a second, with no OXT install, and to explain them
+better than the engine does (a broken script-only stack fails SILENTLY there).
+Every rule below was learned from a real failure; when a rule and the real
+compiler disagree, the compiler wins and the rule is fixed (the old "LCB has no
+and/or" rule was wrong: both are compiler built-ins, grammar.g).
 
 ShowControl has two script layers, with different grammars, and this tool lints
 BOTH:
@@ -58,10 +63,12 @@ LCB_EXPECTED = [
     ROOT / "src" / "midi" / "midi.lcb",
     ROOT / "src" / "artnet" / "artnet.lcb",
 ]
-LCB_TARGETS = sorted(set(LCB_EXPECTED) | set((ROOT / "src").glob("*/*.lcb")))
+LCB_TARGETS = sorted(set(LCB_EXPECTED) | set((ROOT / "src").glob("*/*.lcb"))
+                     | set((ROOT / "tests" / "lcb").glob("*.lcb")))
 
 # The example stacks, in LiveCodeScript. The directory may be empty for now.
-SCRIPT_TARGETS = sorted((ROOT / "examples").glob("*.livecodescript"))
+SCRIPT_TARGETS = sorted((ROOT / "examples").glob("*.livecodescript")) + \
+    sorted((ROOT / "tests" / "lcs").glob("*.livecodescript"))
 
 SMART_QUOTES = {0x2018, 0x2019, 0x201C, 0x201D}
 
@@ -247,8 +254,18 @@ LCB_FORBIDDEN = (
     (re.compile(r"\bnumToChar\s*\("), "numToChar() is LiveCode Script -- LCB uses 'the char with code (n)'"),
     (re.compile(r"\bcharToNum\s*\("), "charToNum() is LiveCode Script -- LCB uses 'the code of (c)'"),
     (re.compile(r"\bdiv\b"),          "'div' is LiveCode Script -- LCB has no integer-division operator"),
-    (re.compile(r"\bor\b"),           "'or' is not an LCB operator (commented out in logic.lcb) -- restructure the condition"),
-    (re.compile(r"\band\b"),          "'and' is not an LCB operator (commented out in logic.lcb) -- restructure the condition"),
+    # NOTE: `and` / `or` ARE valid LCB. They are commented out in logic.lcb only
+    # because the COMPILER implements them (short-circuit, toolchain/lc-compile
+    # grammar.g), on the 9.6.3 floor too; a rule here once claimed otherwise and
+    # forced awkward nested ifs. lc-compile now arbitrates (tools/run-lcb-tests.py).
+)
+
+# Foreign-binding rules (checked on the declaration line itself).
+LCB_FOREIGN_FORBIDDEN = (
+    (re.compile(r"\bforeign\s+handler\b.*\breturns\s+(optional\s+)?ZString", re.I),
+     "a foreign handler must not RETURN a ZString*: the engine wraps it in a foreign value whose "
+     "finalizer free()s the pointer -- a static/model-owned C string crashes or double-frees "
+     "(libscript module-foreign.cpp). Use a caller buffer (bytes-written / -needed)"),
 )
 
 
@@ -263,6 +280,11 @@ def check_lcb_scriptisms(text):
         code = strip_comment(raw)                       # drop trailing -- comment
         code = re.sub(r'"[^"]*"', '""', code)           # neutralise string-literal contents
         for rx, msg in LCB_FORBIDDEN:
+            if rx.search(code):
+                errors.append(f"  L{lineno}: {msg}")
+    for lineno, raw in enumerate(clean.split("\n"), 1):
+        code = strip_comment(raw)
+        for rx, msg in LCB_FOREIGN_FORBIDDEN:
             if rx.search(code):
                 errors.append(f"  L{lineno}: {msg}")
     return errors
@@ -358,6 +380,34 @@ def check_dangling_else(text):
     return errors
 
 
+# LiveCode Script constructs a real OXT engine rejects or mis-runs. Each was
+# observed on the engine (tests/lcs, OXT 9.7.1), not inferred.
+SCRIPT_FORBIDDEN = (
+    (re.compile(r"\bdoes\s+not\s+(contain|begin|end)\b", re.I),
+     "'does not contain/begin/end' does not parse in OXT, and the failure is SILENT -- a "
+     "script-only stack containing it never opens. Write `not (x contains y)`"),
+    (re.compile(r"^\s*repeat\s+with\b.*\bstep\b", re.I),
+     "'repeat with ... step N' OVERSHOOTS its end bound in OXT (1 to 9 step 3 visits 10) -- "
+     "loop an index without step and compute the value"),
+)
+
+
+def check_script_forbidden(text):
+    errors = []
+    for lineno, code in logical_lines(text):
+        code = re.sub(r'"[^"]*"', '""', code)
+        for rx, msg in SCRIPT_FORBIDDEN:
+            if rx.search(code):
+                errors.append(f"  L{lineno}: {msg}")
+    return errors
+
+
+SCRIPT_KEYWORDS_BEFORE_VALUE = {
+    "put", "return", "into", "after", "before", "with", "is", "then", "else", "to",
+    "and", "or", "not", "get", "pass", "send", "of", "in", "contains",
+}
+
+
 def check_script_array_literals(text):
     """LiveCode Script has NO ``[...]`` list-literal expression -- that is LiveCode
     BUILDER syntax. In a .livecodescript, a ``[`` that is not an array SUBSCRIPT
@@ -382,7 +432,15 @@ def check_script_array_literals(text):
             while j >= 0 and code[j] in " \t":
                 j -= 1
             prev = code[j] if j >= 0 else ""
-            if prev not in ident:
+            # The word before the '[' -- a KEYWORD there ("put [..] into",
+            # "return [..]") means a literal, not a subscript. (Found by
+            # tests/checker_fixtures_test.py: `put [...]` used to slip through
+            # because the 't' of "put" looked like an identifier.)
+            k = j
+            while k >= 0 and code[k] in ident:
+                k -= 1
+            prev_word = code[k + 1:j + 1].lower()
+            if prev not in ident or prev_word in SCRIPT_KEYWORDS_BEFORE_VALUE:
                 errors.append(
                     f"  L{lineno}: '[...]' list literal is LiveCode Builder syntax -- LiveCode "
                     "Script has no list-literal expression; build the array by assignment "
@@ -410,6 +468,7 @@ def lint_file(path, kind):
         problems += check_script_structure(text)
         problems += check_dangling_else(text)
         problems += check_script_array_literals(text)
+        problems += check_script_forbidden(text)
     return problems
 
 
@@ -442,8 +501,8 @@ def run_layer(title, targets, kind):
 
 def main():
     failures = 0
-    failures += run_layer("LiveCode Builder bindings (src/<ext>/<ext>.lcb)", LCB_TARGETS, "lcb")
-    failures += run_layer("LiveCodeScript examples (examples/*.livecodescript)", SCRIPT_TARGETS, "script")
+    failures += run_layer("LiveCode Builder (src/<ext>/<ext>.lcb, tests/lcb/*.lcb)", LCB_TARGETS, "lcb")
+    failures += run_layer("LiveCodeScript (examples/, tests/lcs/)", SCRIPT_TARGETS, "script")
 
     if failures:
         print(f"FAILED -- {failures} check(s) need attention.")

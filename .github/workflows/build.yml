@@ -40,8 +40,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Static .lcb / .livecodescript gates
-        run: python3 tools/check-livecodescript.py
+      - name: Static .lcb / .livecodescript gates (+ their fixtures)
+        run: |
+          python3 tests/checker_fixtures_test.py
+          python3 tools/check-livecodescript.py
       - name: Art-Net golden-packet spec
         run: python3 tests/artnet_golden_test.py
       - name: ALSA headers (for the MIDI shim)
@@ -66,7 +68,7 @@ jobs:
             -DCMAKE_C_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer" \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=all -fno-omit-frame-pointer"
           cmake --build build-asan -j
-          ctest --test-dir build-asan --output-on-failure
+          ctest --test-dir build-asan --output-on-failure --no-tests=error
 
   # Linux x86_64 on a modern toolchain. (Maximally-portable glibc-2.17 binaries
   # via a manylinux container, and 32-bit Linux, are follow-ups -- RtMidi's C++
@@ -83,12 +85,14 @@ jobs:
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON
           cmake --build build --config Release
-          ctest --test-dir build --output-on-failure
+          ctest --test-dir build --output-on-failure --no-tests=error
       - name: Stage libraries
         run: |
           mkdir -p dist
-          cp "$(find build -maxdepth 2 -name osc.so  | head -n1)" dist/osc-linux-x86_64.so
-          cp "$(find build -maxdepth 2 -name midi.so | head -n1)" dist/midi-linux-x86_64.so
+          # -not -path '*/mock/*': the test build also emits the MOCK midi library
+          # (tests/mock/rtmidi_mock.c) as build/mock/midi.so -- never ship that.
+          cp "$(find build -maxdepth 2 -name osc.so  -not -path '*/mock/*' | head -n1)" dist/osc-linux-x86_64.so
+          cp "$(find build -maxdepth 2 -name midi.so -not -path '*/mock/*' | head -n1)" dist/midi-linux-x86_64.so
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -124,13 +128,14 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
       - name: Smoke test
-        run: ctest --test-dir build --build-config Release --output-on-failure
+        run: ctest --test-dir build --build-config Release --output-on-failure --no-tests=error
       - name: Stage libraries
         shell: bash
         run: |
           mkdir -p dist
           for lib in osc midi; do
-            src="$(find build -maxdepth 2 -name "${lib}.${{ matrix.ext }}" | head -n1)"
+            # never the MOCK midi library the test build puts in build/mock/
+            src="$(find build -maxdepth 2 -name "${lib}.${{ matrix.ext }}" -not -path '*/mock/*' | head -n1)"
             test -n "$src" || { echo "missing ${lib}.${{ matrix.ext }}"; exit 1; }
             cp "$src" "dist/${lib}-${{ matrix.name }}.${{ matrix.ext }}"
           done

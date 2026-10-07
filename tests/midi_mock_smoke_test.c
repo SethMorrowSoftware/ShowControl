@@ -23,63 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ===================== mock RtMidi implementation ===================== */
-int mock_backend_ok = 1;
-int mock_port_count = 2;
-int mock_oversize_next = 0;
-
-typedef struct { unsigned char b[70000]; int len; double delta; } qmsg;
-static qmsg q[1024];
-static int q_head = 0, q_tail = 0;
-
-void mock_queue_clear(void) { q_head = q_tail = 0; }
-void mock_queue_push(const unsigned char *msg, int len, double delta) {
-    q[q_tail].len = len; q[q_tail].delta = delta;
-    if (len > 0) memcpy(q[q_tail].b, msg, (size_t) len);
-    q_tail = (q_tail + 1) % 1024;
-}
-
-static struct RtMidiWrapper *make_wrapper(void) {
-    struct RtMidiWrapper *w = (struct RtMidiWrapper *) calloc(1, sizeof *w);
-    w->ok  = mock_backend_ok ? true : false;
-    w->ptr = mock_backend_ok ? (void *) w : NULL;   /* NULL internal object when !ok */
-    return w;
-}
-RtMidiInPtr  rtmidi_in_create_default(void)  { return make_wrapper(); }
-RtMidiOutPtr rtmidi_out_create_default(void) { return make_wrapper(); }
-void rtmidi_open_port(RtMidiPtr d, unsigned int p, const char *n) { (void)d;(void)p;(void)n; }
-void rtmidi_open_virtual_port(RtMidiPtr d, const char *n) { (void)d;(void)n; }
-void rtmidi_close_port(RtMidiPtr d) { (void)d; }
-unsigned int rtmidi_get_port_count(RtMidiPtr d) { (void)d; return (unsigned) mock_port_count; }
-
-/* RtMidi 6.0.0: with bufOut != NULL returns snprintf's count (full length), never
- * writes *bufLen. The shim must trust the RETURN value, not *bufLen. */
-int rtmidi_get_port_name(RtMidiPtr d, unsigned int p, char *buf, int *buflen) {
-    (void)d;
-    char name[64];
-    snprintf(name, sizeof name, "MockPort-%u-aLongishName", p);
-    if (buf && buflen && *buflen > 0) return snprintf(buf, (size_t) *buflen, "%s", name);
-    return (int) strlen(name);
-}
-void rtmidi_in_ignore_types(RtMidiInPtr d, bool a, bool b, bool c) { (void)d;(void)a;(void)b;(void)c; }
-
-double rtmidi_in_get_message(RtMidiInPtr d, unsigned char *message, size_t *size) {
-    (void)d;
-    if (q_head == q_tail) { *size = 0; return 0.0; }       /* queue empty */
-    qmsg *m = &q[q_head];
-    q_head = (q_head + 1) % 1024;                          /* destructive pop */
-    double delta = m->delta;
-    size_t real = (size_t) m->len;
-    if (mock_oversize_next) { mock_oversize_next = 0; *size = 70000; return delta; }
-    if (real <= *size) memcpy(message, m->b, real);        /* else no copy (RtMidi behavior) */
-    *size = real;
-    return delta;
-}
-int rtmidi_out_send_message(RtMidiOutPtr d, const unsigned char *data, int len) {
-    (void)d;(void)data; return len > 0 ? 0 : -1;
-}
-void rtmidi_in_free(RtMidiInPtr d) { free(d); }
-void rtmidi_out_free(RtMidiOutPtr d) { free(d); }
+/* The mock RtMidi implementation lives in tests/mock/rtmidi_mock.c (shared with
+ * the mock midi shared library the headless LCB suite loads). */
 
 /* ===================== test harness ===================== */
 static int g_pass = 0, g_fail = 0;
@@ -108,7 +53,7 @@ static void decode_records(const unsigned char *buf, int n_records,
 
 int main(void) {
     printf("midi ABI = %d\n", midi_abi_version());
-    check("ABI is 1", midi_abi_version() == 1);
+    check("ABI is 2", midi_abi_version() == 2);
     check("in_count is the port count", midi_in_count() == 2);
 
     /* port name: trust the return value (full length), even when truncated */
@@ -119,6 +64,9 @@ int main(void) {
     int t = midi_in_name(0, tiny, sizeof tiny);
     check("tiny buffer reports truncation (negative)", t < 0);
     check("tiny buffer is NUL-terminated", tiny[7] == '\0');
+    /* the shim's cached enumerator(s) stay alive for the process; everything opened
+     * after this point must be freed again by midi_close */
+    const int live_base = midimock_live_wrappers();
 
     int32_t in = midi_in_open_virtual("test");
     check("opened a virtual input", in != 0);
@@ -188,6 +136,33 @@ int main(void) {
     check("oversize skipped; next msg still delivered", midi_in_drain(in, out, KDRAINCAP, 256) == 1);
     { char e[256]; midi_last_error(e, sizeof e); check("oversize drop set an error", e[0] != '\0'); }
 
+    /* midi_in_drain_bytes (ABI 2): the same drain, returning BYTES written --
+     * what the LCB binding uses to copy exactly the written bytes back out. */
+    mock_queue_clear();
+    { unsigned char m1[3]={0x90,60,100}, m2[2]={0xC0,5};
+      mock_queue_push(m1,3,0.0); mock_queue_push(m2,2,0.0);
+      int32_t nb = midi_in_drain_bytes(in, out, KDRAINCAP, 256);
+      check("drain_bytes = (2+3+4) + (2+2+4) = 17", nb == 17);
+      check("drain_bytes of empty queue -> 0", midi_in_drain_bytes(in, out, KDRAINCAP, 256) == 0); }
+
+    /* virtual cable: with loopback on, an output's sends arrive on the input side,
+     * and every send is logged byte-for-byte. */
+    mock_queue_clear();
+    midimock_set_loopback(1, 250);
+    { int32_t o = midi_out_open_virtual("loop out");
+      unsigned char nn[3]={0x91,64,127};
+      check("loopback: send ok", midi_out_send(o, nn, 3) == 1);
+      check("loopback: send logged", midimock_sent_count() >= 1);
+      unsigned char got[8]; int32_t gl = midimock_sent_get(midimock_sent_count()-1, got, sizeof got);
+      check("loopback: logged bytes exact", gl == 3 && got[0]==0x91 && got[1]==64 && got[2]==127);
+      int n = midi_in_drain(in, out, KDRAINCAP, 256);
+      int lens[2]; static unsigned char msgs[2][70000]; uint32_t d[2];
+      decode_records(out, n, lens, msgs, d);
+      check("loopback: arrives on the input", n == 1 && lens[0] == 3 && msgs[0][0] == 0x91);
+      check("loopback: stamped delta (250us)", n == 1 && d[0] == 250);
+      midi_close(o); }
+    midimock_set_loopback(0, 0);
+
     midi_close(in);
     check("drain after close -> 0", midi_in_drain(in, out, KDRAINCAP, 256) == 0);
 
@@ -201,6 +176,19 @@ int main(void) {
     check("no-backend open fails cleanly", midi_in_open(0) == 0);
     { char e[256]; midi_last_error(e, sizeof e); check("failed open set an error", e[0] != '\0'); }
     mock_backend_ok = 1;
+
+    /* Windows MM has no virtual ports and RtMidi only WARNS: the shim must refuse
+     * (0 + error) rather than return a handle that silently sends nowhere. */
+    midimock_set_api(RTMIDI_API_WINDOWS_MM);
+    check("WinMM: virtual output refused", midi_out_open_virtual("v") == 0);
+    { char e[256]; midi_last_error(e, sizeof e); check("WinMM: refusal names loopMIDI", strstr(e, "loopMIDI") != NULL); }
+    check("WinMM: virtual input refused", midi_in_open_virtual("v") == 0);
+    { int32_t h = midi_out_open(0); check("WinMM: hardware port still opens", h != 0); midi_close(h); }
+    midimock_set_api(RTMIDI_API_LINUX_ALSA);
+
+    /* every port this test opened was freed by midi_close (only the shim's cached
+     * enumerators, counted in live_base, stay alive) */
+    check("no leaked RtMidi instances", midimock_live_wrappers() == live_base);
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

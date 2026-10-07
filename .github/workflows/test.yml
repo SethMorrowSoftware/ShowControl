@@ -1,0 +1,190 @@
+name: test
+
+# Hardware-free automated testing of all three extensions -- no MIDI devices, no
+# Art-Net nodes, no OSC controllers, no display. (build.yml builds, sanitizes and
+# packages the native shims; this workflow tests the WHOLE stack.)
+#
+#   reference   the shared wire-format vectors against clean-room spec codecs
+#               AND the third-party python-osc; the virtual peers' self-test;
+#               generated-file freshness; the static gates' own fixtures
+#   fuzz        coverage-guided libFuzzer + ASan/UBSan on osc_parse (the one
+#               entry point that eats untrusted network bytes)
+#   oxt         per OS, against a REAL downloaded OXT-Beyond engine:
+#                 * LCB under lc-run  -- every binding compiled by lc-compile and
+#                   run end to end; MIDI through the mock RtMidi library (a
+#                   virtual loopback cable), OSC through the real shim
+#                 * LiveCode Script in the standalone engine with -ui -- the
+#                   Script<->LCB boundary, the shipped helpers and self-test,
+#                   real UDP through the engine's sockets, and interop with
+#                   independent virtual peers (tools/sim/)
+#               --require-all: a suite that cannot run (missing library, an
+#               engine that cannot do sockets without a UI) FAILS, never skips.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      oxt_tag:
+        description: "OXT-Beyond release tag to test against"
+        required: false
+        default: ""
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OXT_REPO: SethMorrowSoftware/OpenXTalk-Beyond
+  # Pinned: a new engine is a deliberate bump (>= 0.2.1-rc.2 is required on
+  # Windows -- older engines deliver no socket events without a UI).
+  OXT_TAG: ${{ github.event.inputs.oxt_tag || 'v0.2.3' }}
+
+jobs:
+  reference:
+    name: vectors + peers + gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Third-party OSC implementation for the cross-check
+        run: python -m pip install python-osc
+      - name: Shared vectors vs clean-room codecs + python-osc
+        env:
+          SHOWCONTROL_REQUIRE_PYTHONOSC: "1"
+        run: python tests/vectors_reference_test.py
+      - name: Art-Net golden packets
+        run: python tests/artnet_golden_test.py
+      - name: Virtual peers behave like real gear (fixture before gate)
+        run: python tests/simulators_test.py
+      - name: Generated C vectors header is fresh
+        run: python tools/gen_vectors.py --check
+      - name: Static gates + their fixtures
+        run: |
+          python tests/checker_fixtures_test.py
+          python tools/check-livecodescript.py
+
+  fuzz:
+    name: libFuzzer osc_parse (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the coverage-guided fuzzer
+        run: |
+          clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+            -DSHOWCONTROL_LIBFUZZER -D_DEFAULT_SOURCE \
+            -Isrc/osc -Isrc/third_party/tinyosc -Itests \
+            src/osc/osc_shim.c src/third_party/tinyosc/tinyosc.c tests/fuzz/osc_fuzz.c \
+            -o osc_libfuzzer
+      - name: Seed corpus from the shared vectors
+        run: python3 tools/gen_vectors.py --corpus fuzz-corpus
+      - name: Fuzz for 3 minutes
+        run: |
+          mkdir -p fuzz-artifacts
+          ./osc_libfuzzer -max_total_time=180 -print_final_stats=1 -max_len=4096 \
+            -artifact_prefix=fuzz-artifacts/ fuzz-corpus
+      - name: Keep any crashing input (replay with osc_fuzz --replay FILE)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz-artifacts/
+
+  oxt:
+    name: OXT headless (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            asset: linux-x86_64-binaries.tar.xz
+            cmake_args: ""
+          - name: windows-x64
+            os: windows-2022
+            asset: win-x86_64-binaries.zip
+            cmake_args: "-A x64"
+          - name: macos-arm64
+            os: macos-15
+            asset: mac-universal-binaries.tar.xz
+            cmake_args: ""
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Engine runtime + ALSA headers (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # the engine's "core" libraries (OXT-Beyond Installer/linux/libraries.txt)
+          sudo apt-get install -y libglib2.0-0t64 libfontconfig1 libfreetype6 libasound2-dev
+
+      - name: Cache the OXT toolchain + engine
+        id: oxt-cache
+        uses: actions/cache@v4
+        with:
+          path: oxt
+          key: oxt-${{ matrix.asset }}-${{ env.OXT_TAG }}
+
+      - name: Download OXT-Beyond ${{ env.OXT_TAG }} (checksum-verified)
+        if: steps.oxt-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dl oxt
+          gh release download "$OXT_TAG" --repo "$OXT_REPO" --dir dl \
+            --pattern "*-${{ matrix.asset }}" --pattern SHA256SUMS
+          cd dl
+          f=$(ls *-${{ matrix.asset }})
+          want=$(grep -- " \*\?$f\$" SHA256SUMS | awk '{print $1}')
+          have=$(python -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$f")
+          echo "sha256 $have  ($f)"
+          test -n "$want" && test "$want" = "$have"
+          case "$f" in
+            *.zip) python -m zipfile -e "$f" ../oxt ;;
+            *)     tar -xJf "$f" -C ../oxt ;;
+          esac
+
+      - name: Locate lc-compile / lc-run / the standalone engine
+        run: |
+          lcc=$(find oxt -type f \( -name lc-compile -o -name lc-compile.exe \) | head -n1)
+          test -n "$lcc" || { echo "no lc-compile in the archive"; find oxt -maxdepth 3; exit 1; }
+          bin="$PWD/$(dirname "$lcc")"
+          chmod +x "$bin"/lc-compile* "$bin"/lc-run* 2>/dev/null || true
+          echo "OXT_BIN=$bin" >> "$GITHUB_ENV"
+          echo "toolchain: $bin"
+
+      - name: Build the shims, the mock MIDI library and the C tests
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSHOWCONTROL_BUILD_TESTS=ON ${{ matrix.cmake_args }}
+          cmake --build build --config Release
+          ctest --test-dir build --build-config Release --output-on-failure --no-tests=error
+
+      - name: LCB bindings under lc-run
+        env:
+          SHOWCONTROL_REQUIRE_ALL: "1"
+        run: python tools/run-lcb-tests.py --oxt-bin "$OXT_BIN" --build-dir build --min-assertions 550 --tap-out lcb-tests.tap
+
+      - name: LiveCode Script in the engine (-ui) -- boundary, helpers, self-test, UDP, interop
+        env:
+          SHOWCONTROL_REQUIRE_ALL: "1"
+        run: python tools/run-lcs-tests.py --oxt-bin "$OXT_BIN" --build-dir build --min-assertions 120 -v
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-${{ matrix.name }}
+          path: |
+            lcb-tests.tap
+            build/lcb-tests/gen/
+          if-no-files-found: ignore

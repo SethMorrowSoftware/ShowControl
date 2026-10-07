@@ -154,6 +154,12 @@ def do_check():
     return 0
 
 
+def is_test_double(path):
+    """True if the binary exports the mock's midimock_* controls."""
+    with open(path, "rb") as f:
+        return b"midimock_" in f.read()
+
+
 def do_refresh(args):
     """Copy each provided source into its committed slot under the bare token
     name. Returns an exit code."""
@@ -165,10 +171,15 @@ def do_refresh(args):
             if not src:
                 continue
             src_abs = src if os.path.isabs(src) else os.path.join(ROOT, src)
-            if os.path.isfile(src_abs):
-                plan.append((dest_path(ext, platform_id, file_suffix), src_abs))
-            else:
+            if not os.path.isfile(src_abs):
                 problems.append(f"--{ext}-{suffix}: not a file: {src}")
+            elif is_test_double(src_abs):
+                # The test build emits a MOCK midi library (tests/mock/rtmidi_mock.c,
+                # under build/mock/) with the same bare name; it must never ship.
+                problems.append(f"--{ext}-{suffix}: {src} is the MOCK library (exports midimock_*) -- "
+                                "refusing to package a test double")
+            else:
+                plan.append((dest_path(ext, platform_id, file_suffix), src_abs))
 
     if not plan and not problems:
         print("Nothing to do. Pass an --<ext>-<platform> flag (e.g. --osc-linux64,", file=sys.stderr)

@@ -1,0 +1,197 @@
+/*
+_midimock.lcb - LCB handles on the MOCK midi library's test controls.
+
+The mock library (CMake target midi_mock: src/midi/midi_shim.c over
+tests/mock/rtmidi_mock.c, built as "midi" under <build>/mock/) is a drop-in for
+the shipped midi library. Besides the real midi_* ABI it exports midimock_*
+controls -- inject inbound messages, a virtual loopback cable, a log of every
+sent message -- and this module wraps them for the test suites.
+
+These bindings exist ONLY in the mock library. Binding is lazy, so loading this
+module next to the REAL library is harmless as long as nothing calls it; a suite
+that calls these declares `-- requires: midi-mock`.
+
+Byte buffers follow the binding's own FFI rules (a Data does not bridge to a
+Pointer): inputs go through MCDataGetBytePtr, outputs through an MCMemoryAllocate
+block copied back with MCDataCreateWithBytes.
+*/
+
+library org.openxtalk.showcontrol.tests.midimock
+
+use com.livecode.foreign
+
+metadata version is "1.0.0"
+metadata author is "ShowControl contributors"
+
+private foreign handler _reset() returns nothing binds to "c:midi>midimock_reset!cdecl"
+private foreign handler _is_mock() returns CInt binds to "c:midi>midimock_is_mock!cdecl"
+private foreign handler _set_backend_ok(in pOk as CInt) returns nothing binds to "c:midi>midimock_set_backend_ok!cdecl"
+private foreign handler _set_port_count(in pN as CInt) returns nothing binds to "c:midi>midimock_set_port_count!cdecl"
+private foreign handler _set_oversize_next(in pOn as CInt) returns nothing binds to "c:midi>midimock_set_oversize_next!cdecl"
+private foreign handler _set_send_fail(in pOn as CInt) returns nothing binds to "c:midi>midimock_set_send_fail!cdecl"
+private foreign handler _set_api(in pApi as CInt) returns nothing binds to "c:midi>midimock_set_api!cdecl"
+private foreign handler _set_loopback(in pOn as CInt, in pDeltaUs as CInt) returns nothing binds to "c:midi>midimock_set_loopback!cdecl"
+private foreign handler _push(in pBytes as optional Pointer, in pLen as CInt, in pDeltaUs as CInt) returns CInt binds to "c:midi>midimock_push!cdecl"
+private foreign handler _queue_depth() returns CInt binds to "c:midi>midimock_queue_depth!cdecl"
+private foreign handler _sent_count() returns CInt binds to "c:midi>midimock_sent_count!cdecl"
+private foreign handler _sent_get(in pI as CInt, in pOut as optional Pointer, in pCap as CInt) returns CInt binds to "c:midi>midimock_sent_get!cdecl"
+private foreign handler _sent_clear() returns nothing binds to "c:midi>midimock_sent_clear!cdecl"
+private foreign handler _live_wrappers() returns CInt binds to "c:midi>midimock_live_wrappers!cdecl"
+
+private foreign handler MCDataGetBytePtr(in pData as Data) returns Pointer binds to "<builtin>"
+private foreign handler MCMemoryAllocate(in pSize as UIntSize, out rBlock as Pointer) returns CBool binds to "<builtin>"
+private foreign handler MCMemoryDeallocate(in pBlock as Pointer) returns nothing binds to "<builtin>"
+private foreign handler MCDataCreateWithBytes(in pBytes as Pointer, in pCount as CUInt, out rData as Data) returns CBool binds to "<builtin>"
+
+variable sBufPtr as Pointer
+variable sBufCap as Integer
+
+private handler flag(in pOn as Boolean) returns Integer
+   if pOn then
+      return 1
+   end if
+   return 0
+end handler
+
+-- Reset every knob, the inbound queue and the sent log.
+public handler MockReset()
+   unsafe
+      _reset()
+   end unsafe
+end handler
+
+public handler MockIsMock() returns Boolean
+   variable tR as Integer
+   unsafe
+      put _is_mock() into tR
+   end unsafe
+   return tR is 1
+end handler
+
+public handler MockSetBackendOk(in pOk as Boolean)
+   unsafe
+      _set_backend_ok(flag(pOk))
+   end unsafe
+end handler
+
+public handler MockSetPortCount(in pCount as Integer)
+   unsafe
+      _set_port_count(pCount)
+   end unsafe
+end handler
+
+-- The next inbound message is reported larger than RtMidi's buffer (dropped).
+public handler MockSetOversizeNext(in pOn as Boolean)
+   unsafe
+      _set_oversize_next(flag(pOn))
+   end unsafe
+end handler
+
+-- Make every send fail until switched off (exercises the error path).
+public handler MockSetSendFail(in pOn as Boolean)
+   unsafe
+      _set_send_fail(flag(pOn))
+   end unsafe
+end handler
+
+-- Impersonate a MIDI backend by RtMidiApi number: 4 = Windows MM (no virtual
+-- ports), 2 = ALSA (the default), 1 = CoreMIDI.
+public handler MockSetApi(in pApi as Integer)
+   unsafe
+      _set_api(pApi)
+   end unsafe
+end handler
+
+-- The virtual cable: with it on, everything an output sends arrives as inbound,
+-- stamped with pDeltaUs microseconds.
+public handler MockSetLoopback(in pOn as Boolean, in pDeltaUs as Integer)
+   unsafe
+      _set_loopback(flag(pOn), pDeltaUs)
+   end unsafe
+end handler
+
+-- Inject one inbound message (any input port drains it). Returns false when the
+-- mock queue is full.
+public handler MockPush(in pBytes as Data, in pDeltaUs as Integer) returns Boolean
+   variable tR as Integer
+   variable tPtr as Pointer
+   unsafe
+      if the number of bytes in pBytes > 0 then
+         put MCDataGetBytePtr(pBytes) into tPtr
+         put _push(tPtr, the number of bytes in pBytes, pDeltaUs) into tR
+      else
+         put _push(nothing, 0, pDeltaUs) into tR
+      end if
+   end unsafe
+   return tR is 1
+end handler
+
+public handler MockQueueDepth() returns Integer
+   variable tR as Integer
+   unsafe
+      put _queue_depth() into tR
+   end unsafe
+   return tR
+end handler
+
+public handler MockSentCount() returns Integer
+   variable tR as Integer
+   unsafe
+      put _sent_count() into tR
+   end unsafe
+   return tR
+end handler
+
+-- The pIndex-th (1-based) message any output sent since the last reset/clear.
+-- Empty Data when out of range.
+public handler MockSent(in pIndex as Integer) returns Data
+   variable tNeed as Integer
+   variable tGot as Integer
+   variable tOk as Boolean
+   variable tData as Data
+   put the empty data into tData
+   unsafe
+      put _sent_get(pIndex - 1, nothing, 0) into tNeed
+   end unsafe
+   if tNeed >= 0 then
+      return tData                 -- 0 = out of range (0-length sends are impossible)
+   end if
+   put -tNeed into tNeed
+   if sBufCap < tNeed then
+      if sBufCap > 0 then
+         unsafe
+            MCMemoryDeallocate(sBufPtr)
+         end unsafe
+         put 0 into sBufCap
+      end if
+      unsafe
+         put MCMemoryAllocate(tNeed, sBufPtr) into tOk
+      end unsafe
+      if not tOk then
+         throw "midimock: allocation failed"
+      end if
+      put tNeed into sBufCap
+   end if
+   unsafe
+      put _sent_get(pIndex - 1, sBufPtr, sBufCap) into tGot
+      put MCDataCreateWithBytes(sBufPtr, tGot, tData) into tOk
+   end unsafe
+   return tData
+end handler
+
+public handler MockSentClear()
+   unsafe
+      _sent_clear()
+   end unsafe
+end handler
+
+-- RtMidi instances created and not yet freed (a leak check for midiClose).
+public handler MockLiveWrappers() returns Integer
+   variable tR as Integer
+   unsafe
+      put _live_wrappers() into tR
+   end unsafe
+   return tR
+end handler
+
+end library

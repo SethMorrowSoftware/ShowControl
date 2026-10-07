@@ -77,6 +77,25 @@ if(SHOWCONTROL_BUILD_OSC)
             target_link_libraries(osc_smoke PRIVATE m)
         endif()
         add_test(NAME osc_smoke COMMAND osc_smoke)
+
+        # The shared wire-format vectors (tests/vectors/osc.json, projected into
+        # the committed tests/vectors/vectors.h by tools/gen_vectors.py).
+        add_executable(osc_vectors tests/osc_vectors_test.c)
+        target_include_directories(osc_vectors PRIVATE src/osc tests)
+        target_link_libraries(osc_vectors PRIVATE osc)
+        if(NOT MSVC)
+            target_link_libraries(osc_vectors PRIVATE m)
+        endif()
+        add_test(NAME osc_vectors COMMAND osc_vectors)
+
+        # Deterministic mutation fuzzer over osc_parse + every getter, seeded from
+        # the vectors (tests/fuzz/osc_fuzz.c). Under the ASan/UBSan CI build every
+        # one of these iterations is sanitizer-checked; the coverage-guided
+        # libFuzzer build of the same file runs in the CI "fuzz" job.
+        add_executable(osc_fuzz tests/fuzz/osc_fuzz.c)
+        target_include_directories(osc_fuzz PRIVATE src/osc tests)
+        target_link_libraries(osc_fuzz PRIVATE osc)
+        add_test(NAME osc_fuzz COMMAND osc_fuzz 100000 1)
     endif()
 endif()
 
@@ -141,6 +160,7 @@ endif()
 if(SHOWCONTROL_BUILD_TESTS)
     add_executable(midi_mock_smoke
         src/midi/midi_shim.c
+        tests/mock/rtmidi_mock.c
         tests/midi_mock_smoke_test.c)
     # tests/mock FIRST so the shim's #include "rtmidi_c.h" resolves to the mock.
     target_include_directories(midi_mock_smoke PRIVATE tests/mock src/midi)
@@ -151,6 +171,44 @@ if(SHOWCONTROL_BUILD_TESTS)
         target_compile_options(midi_mock_smoke PRIVATE -Wall -Wextra)
     endif()
     add_test(NAME midi_mock_smoke COMMAND midi_mock_smoke)
+
+    # -----------------------------------------------------------------------
+    # The MOCK midi shared library: the real midi_shim.c over the RtMidi test
+    # double, built under the SAME bare name "midi" but into <build>/mock/, so it
+    # is a drop-in for the shipped library. tools/run-lcb-tests.py stages it for
+    # the headless LCB suite: midi.lcb's "c:midi>" bindings then run the whole
+    # MIDI stack (binding + FFI marshalling + shim) end to end with no hardware
+    # and no OS MIDI service. It also exports the midimock_* controls (inject
+    # inbound, loopback cable, sent log) that tests/lcb/midi_test.lcb binds.
+    # NEVER packaged: package-extension.py only ever copies the real "midi".
+    # -----------------------------------------------------------------------
+    add_library(midi_mock SHARED
+        src/midi/midi_shim.c
+        tests/mock/rtmidi_mock.c)
+    target_include_directories(midi_mock PRIVATE tests/mock src/midi)
+    set_target_properties(midi_mock PROPERTIES
+        C_STANDARD 17
+        C_STANDARD_REQUIRED ON
+        C_VISIBILITY_PRESET hidden
+        OUTPUT_NAME "midi"
+        PREFIX ""
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mock"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mock"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mock")
+    # Multi-config generators (MSVC, Xcode) append /<Config>; pin every config to
+    # the same folder so the runner finds it without guessing.
+    foreach(cfg Debug Release RelWithDebInfo MinSizeRel)
+        string(TOUPPER ${cfg} CFG)
+        set_target_properties(midi_mock PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY_${CFG} "${CMAKE_BINARY_DIR}/mock"
+            RUNTIME_OUTPUT_DIRECTORY_${CFG} "${CMAKE_BINARY_DIR}/mock"
+            ARCHIVE_OUTPUT_DIRECTORY_${CFG} "${CMAKE_BINARY_DIR}/mock")
+    endforeach()
+    if(MSVC)
+        target_compile_options(midi_mock PRIVATE /W3)
+    else()
+        target_compile_options(midi_mock PRIVATE -Wall -Wextra)
+    endif()
 endif()
 
 # Build:
