@@ -561,31 +561,45 @@ static int32_t parse_message_bytes(const uint8_t *data, int32_t len) {
     memcpy(m->typetag, data + tt_start, (size_t)ntags);
     m->typetag[ntags] = '\0';
 
-    /* tinyosc decode -- safe now that validate_message proved every field. */
-    tosc_message tm;
-    tosc_parseMessage(&tm, (char*) m->data, len);
-    for (int32_t k = 0; k < ntags; k++) {
-        char t = m->typetag[k];
-        parsed_arg *a = &m->args[k];
-        a->type = t;
-        switch (t) {
-            case 'i': a->i = tosc_getNextInt32(&tm);  break;
-            case 'h': a->i = tosc_getNextInt64(&tm);  break;
-            case 't': a->i = (int64_t) tosc_getNextTimetag(&tm); break;
-            case 'f': a->d = (double) tosc_getNextFloat(&tm);    break;
-            case 'd': a->d = tosc_getNextDouble(&tm); break;
-            case 's': {
-                const char *s = tosc_getNextString(&tm);
-                a->off = (int32_t)((const uint8_t*) s - m->data);
-                a->len = (int32_t) strlen(s);
-                break; }
-            case 'b': {
-                const char *bp = NULL; int bl = 0;
-                tosc_getNextBlob(&tm, &bp, &bl);
-                a->off = (int32_t)((const uint8_t*) bp - m->data);
-                a->len = bl;
-                break; }
-            default: break; /* T F N I */
+    /* Decode every value at the offsets validate_message PROVED -- never through
+     * tinyosc's cursor. tinyosc's tosc_parseMessage locates the type tag by
+     * scanning for the first ',' after the address NUL, so a ',' hidden in the
+     * address PADDING (OSC says those bytes are NUL; a hostile sender need not
+     * comply) puts tinyosc's argument cursor inside the type-tag string. The old
+     * code then read values from tinyosc's offsets while trusting OUR validated
+     * layout: a blob length landed on garbage and osc_arg_blob read out of
+     * bounds -- a remote crash from one 72-byte datagram, found by
+     * tests/fuzz/osc_fuzz.c (seed 7, iteration 360207) and pinned in the vectors.
+     * One parser, one interpretation: walk the same offsets the validator did. */
+    {
+        int32_t p = arg_pos;
+        for (int32_t k = 0; k < ntags; k++) {
+            char t = m->typetag[k];
+            parsed_arg *a = &m->args[k];
+            const uint8_t *q = m->data + p;
+            a->type = t;
+            switch (t) {
+                case 'i': a->i = (int32_t) be32_load(q); p += 4; break;
+                case 'f': { uint32_t bits = be32_load(q); float f;
+                            memcpy(&f, &bits, 4); a->d = (double) f; p += 4; break; }
+                case 'h': a->i = (int64_t) be64_load(q); p += 8; break;
+                case 't': a->i = (int64_t) be64_load(q); p += 8; break;
+                case 'd': { uint64_t bits = be64_load(q); double d;
+                            memcpy(&d, &bits, 8); a->d = d; p += 8; break; }
+                case 's': {
+                    /* validate_message proved a NUL inside the datagram */
+                    a->off = p;
+                    a->len = (int32_t) strlen((const char *) q);
+                    p = pad4(p + a->len + 1);
+                    break; }
+                case 'b': {
+                    int32_t bl = (int32_t) be32_load(q);   /* proved 0 <= bl <= len-p-4 */
+                    a->off = p + 4;
+                    a->len = bl;
+                    p = pad4(p + 4 + bl);
+                    break; }
+                default: break; /* T F N I carry no bytes */
+            }
         }
     }
     m->argc = ntags;
